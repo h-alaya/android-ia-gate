@@ -44,16 +44,14 @@ def _android_ids_conflict(a: Fingerprint, b: Fingerprint) -> bool:
     return bool(a.android_id) and bool(b.android_id) and a.android_id != b.android_id
 
 
-def _contradicts(a: Fingerprint, b: Fingerprint, ambiguous_serials: Collection[str] = ()) -> bool:
+def _contradicts(a: Fingerprint, b: Fingerprint) -> bool:
     """True when a known identifier proves `a` and `b` are different devices.
 
-    A serialno shared by several connected devices (`ambiguous_serials`) is not valid (spec §4)
-    and therefore proves nothing.
+    A serialno shared by several connected devices cannot *identify* one device, but two different
+    real serials still prove two devices are distinct, so only placeholder serials are ignored here.
     """
     serials_differ = (
-        is_valid_serialno(a.serialno, ambiguous_serials)
-        and is_valid_serialno(b.serialno, ambiguous_serials)
-        and a.serialno != b.serialno
+        is_valid_serialno(a.serialno) and is_valid_serialno(b.serialno) and a.serialno != b.serialno
     )
     return serials_differ or _android_ids_conflict(a, b)
 
@@ -173,9 +171,7 @@ class DeviceRegistry:
         if fingerprint.android_id:
             found = unique(lambda r: r.fingerprint.android_id == fingerprint.android_id)
             # Cloned ROM images can share one android_id: two valid, different serials rule it out.
-            if found is not None and not _contradicts(
-                records[found].fingerprint, fingerprint, ambiguous_serials
-            ):
+            if found is not None and not _contradicts(records[found].fingerprint, fingerprint):
                 return found
         return None
 

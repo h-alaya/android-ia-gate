@@ -81,8 +81,9 @@ unique stable** :
       les deux `android_id` sont connus et diffèrent (frère d'un lot partageant le serial, ou
       appareil réinitialisé) : on passe alors au critère suivant ;
    3. sinon `android_id` correspondant à exactement un enregistrement → cet ID, sauf si deux
-      `serialno` valides diffèrent (image ROM clonée partageant l'`android_id`) : on passe
-      alors au critère suivant ;
+      `serialno` réels (ni vides ni factices, **même s'ils sont partagés** par des appareils
+      connectés) diffèrent (image ROM clonée partageant l'`android_id`) : on passe alors au
+      critère suivant ;
    4. sinon : non enrôlé.
 
    Un `serialno` est **invalide** s'il est vide, `unknown`, `0123456789ABCDEF`, `0123456789`,

@@ -251,12 +251,21 @@ def test_match_bogus_serial_alone_does_not_match(reg):
 def test_match_ambiguous_serial_uses_android_id(reg):
     # VAL-1's android_id is unknown, so nothing contradicts a serial match on SHARED123.
     reg.enroll("VAL-1", Fingerprint("SHARED123", "", "acme", "X1"), "", NOW)
-    reg.enroll("VAL-2", Fingerprint("OTHER456", "id-two", "acme", "X1"), "", NOW)
+    reg.enroll("VAL-2", Fingerprint(BOGUS, "id-two", "acme", "X1"), "", NOW)
     probe = Fingerprint("SHARED123", "id-two", "acme", "X1")
     # Serial not shared among connected devices: it decides.
     assert reg.match(probe, None, ()) == "VAL-1"
     # The serial is shared by two connected devices: it is not used, android_id decides.
     assert reg.match(probe, None, {"SHARED123"}) == "VAL-2"
+
+
+def test_match_android_id_clone_with_ambiguous_serial_is_not_resolved(reg):
+    # Two different real serials prove two devices, even when one of them is shared right now.
+    reg.enroll("VAL-1", Fingerprint("S1REAL", "X", "acme", "X1"), "", NOW)
+    clone = Fingerprint("S2SHARED", "X", "acme", "X1")
+    assert reg.match(clone, None, ()) is None
+    assert reg.match(clone, None, {"S2SHARED"}) is None
+    assert reg.match(clone, None, {"S1REAL"}) is None
 
 
 def write_records(path, records):
