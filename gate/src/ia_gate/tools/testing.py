@@ -250,6 +250,14 @@ async def stop_instrumentation(ctx: GateContext, device_id: str, test_package: s
     return stopped
 
 
+def _still_running(device_id: str, test_package: str) -> str:
+    return (
+        f"L'arrêt des tests n'a pas pu être confirmé : ils tournent peut-être encore sur {device_id}. "
+        f"Avant de le réutiliser, vérifiez-le avec list_devices puis lancez stop_app sur {test_package} "
+        "et sur l'app testée (ou redémarrez l'appareil)."
+    )
+
+
 def _check_runner(runner: str) -> str:
     if not _RUNNER_RE.fullmatch(runner):
         raise ValueError(
@@ -288,7 +296,9 @@ def register(server: MCPServer, ctx: GateContext) -> None:
         the first 50, stacks cut to their first 2000 chars, `failed` stays exact), whether
         the run completed (false: the app crashed or was killed) and the end of the raw output.
         `test_class` restricts the run to a class, a method (`Class#method`) or a comma-separated
-        list. Install the app and its test APK first with install_apk."""
+        list. Install the app and its test APK first with install_apk. If adb dies mid-run, the
+        partial counts come back with `stopped` (whether the tests were force-stopped on the device)
+        and, when that is not confirmed, a `warning`."""
         key = normalize_device_id(device_id)
         check_package(test_package)
         _check_runner(runner)
@@ -328,11 +338,21 @@ def register(server: MCPServer, ctx: GateContext) -> None:
             except AdbError as exc:
                 if _MISSING_INSTRUMENTATION in str(exc):
                     raise missing from exc
+                # adb died mid-run (USB unplugged, Wi-Fi dropped): the tests may still run on the
+                # device and would keep driving its UI once the device lock is released.
+                stopped = await stop_instrumentation(ctx, key, test_package)
                 _, partial = split_adb_failure(exc)
                 if _STATUS_PREFIX in partial:
-                    # adb died mid-run (e.g. USB unplugged): report what ran; completed is False.
-                    return {"device_id": key, **parse_instrument_output(partial).to_dict()}
-                raise bounded_adb_failure(exc, ctx.config.max_log_bytes) from exc
+                    # Report what ran; completed is False.
+                    result = {"device_id": key, **parse_instrument_output(partial).to_dict()}
+                    result["stopped"] = stopped
+                    if not stopped:
+                        result["warning"] = _still_running(key, test_package)
+                    return result
+                error = bounded_adb_failure(exc, ctx.config.max_log_bytes)
+                if not stopped:
+                    error = ToolError(f"{error} {_still_running(key, test_package)}")
+                raise error from exc
             if _MISSING_INSTRUMENTATION in output:
                 raise missing
             return {"device_id": key, **parse_instrument_output(output).to_dict()}

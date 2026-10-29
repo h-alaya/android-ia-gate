@@ -582,7 +582,59 @@ async def test_run_tests_partial_output_on_adb_failure_is_parsed(client, ctx, fa
     out = data(result)
     assert out["passed"] == 3000
     assert out["completed"] is False
-    assert len(text(result).encode()) <= ctx.config.max_log_bytes
+    assert out["stopped"] is False  # the device is gone: the stop could not be confirmed
+    assert "stop_app" in out["warning"]
+    assert len(text(result).encode()) <= ctx.config.max_log_bytes + 1000
+
+
+async def test_run_tests_adb_death_mid_run_force_stops_instrumentation(client, fake, device):
+    # Wi-Fi link drops mid-run, then comes back: the remaining tests must not keep driving the UI.
+    partial = (
+        "INSTRUMENTATION_STATUS: class=com.example.LoginTest\n"
+        "INSTRUMENTATION_STATUS: test=ok\n"
+        "INSTRUMENTATION_STATUS_CODE: 0\n"
+    )
+    fake.on(["shell", "am", "instrument"], stdout=partial, stderr="error: closed\n",
+            returncode=1, serial=device)
+    fake.on(["shell", "pm", "list", "instrumentation"], stdout=PM_LIST_INSTRUMENTATION, serial=device)
+    fake.on(["shell", "am", "force-stop"], serial=device)
+
+    result = await client.call_tool(
+        "run_instrumented_tests", {"device_id": "VAL-042", "test_package": TEST_PKG}
+    )
+
+    assert not result.is_error, text(result)[:500]
+    out = data(result)
+    assert out["completed"] is False and out["stopped"] is True
+    assert "warning" not in out
+    assert sorted(force_stops(fake)) == ["com.example", TEST_PKG]
+
+
+async def test_run_tests_adb_failure_without_status_force_stops(client, fake, device):
+    fake.on(["shell", "am", "instrument"], stdout="garbage\n", returncode=1, serial=device)
+    fake.on(["shell", "pm", "list", "instrumentation"], stdout=PM_LIST_INSTRUMENTATION, serial=device)
+    fake.on(["shell", "am", "force-stop"], serial=device)
+
+    result = await client.call_tool(
+        "run_instrumented_tests", {"device_id": "VAL-042", "test_package": TEST_PKG}
+    )
+
+    assert result.is_error
+    assert sorted(force_stops(fake)) == ["com.example", TEST_PKG]
+    assert "stop_app" not in text(result)
+
+
+async def test_run_tests_adb_failure_unconfirmed_stop_is_reported(client, fake, device):
+    fake.on(["shell", "am", "instrument"], stdout="garbage\n", returncode=1, serial=device)
+    fake.on(["shell", "pm", "list", "instrumentation"], returncode=1, stderr="error: closed", serial=device)
+    fake.on(["shell", "am", "force-stop"], returncode=1, stderr="error: closed", serial=device)
+
+    result = await client.call_tool(
+        "run_instrumented_tests", {"device_id": "VAL-042", "test_package": TEST_PKG}
+    )
+
+    assert result.is_error
+    assert "stop_app" in text(result)
 
 
 async def test_run_tests_adb_failure_without_status_is_bounded(client, ctx, fake, device):
