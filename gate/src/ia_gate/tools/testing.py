@@ -44,6 +44,11 @@ _RUNNER_RE = re.compile(rf"\.?{_CLASS}", re.ASCII)
 _TEST_ENTRY = rf"{_CLASS}(?:#[A-Za-z_][A-Za-z0-9_$]*)?"
 _TEST_CLASS_RE = re.compile(rf"{_TEST_ENTRY}(?:,{_TEST_ENTRY})*", re.ASCII)
 
+# `AdbClient.shell` failure: "Commande `ARGS` échouée sur TARGET (code N) : OUTPUT". The commands
+# sent by this module never contain parentheses (forbidden or rejected by the validators), so the
+# first "(code N) : " ends the header.
+_ADB_FAILURE_RE = re.compile(r"(.*?\(code -?\d+\)) : (.*)", re.DOTALL)
+
 _SHELL_METACHARS = frozenset(";&|`$><()\n\r\x00")
 _SHELL_METACHARS_TEXT = "; & | ` $ > < ( ) ni retour ligne"
 
@@ -147,6 +152,25 @@ def check_shell_command(command: str, allowlist: Sequence[str]) -> list[str]:
     raise ValueError(f"Commande shell refusée : {command!r} n'est pas autorisée. {advice}")
 
 
+def split_adb_failure(exc: AdbError) -> tuple[str, str]:
+    """Split an `AdbClient.shell` failure into its header (command, target, exit code) and the
+    command output; a message of another shape is returned whole as the header."""
+    message = str(exc)
+    match = _ADB_FAILURE_RE.fullmatch(message)
+    if match is None:
+        return message, ""
+    return match.group(1), match.group(2)
+
+
+def bounded_adb_failure(exc: AdbError, max_bytes: int) -> ToolError:
+    """A `ToolError` for a failed adb command, keeping its header and at most the last
+    `max_bytes` bytes of its output (a failing command may still print megabytes)."""
+    header, output = split_adb_failure(exc)
+    if not output:
+        return ToolError(truncate_tail(header, max_bytes))
+    return ToolError(f"{header} : {truncate_tail(output, max_bytes)}")
+
+
 def _check_runner(runner: str) -> str:
     if not _RUNNER_RE.fullmatch(runner):
         raise ValueError(
@@ -213,7 +237,11 @@ def register(server: MCPServer, ctx: GateContext) -> None:
             except AdbError as exc:
                 if _MISSING_INSTRUMENTATION in str(exc):
                     raise missing from exc
-                raise
+                _, partial = split_adb_failure(exc)
+                if _STATUS_PREFIX in partial:
+                    # adb died mid-run (e.g. USB unplugged): report what ran; completed is False.
+                    return {"device_id": key, **parse_instrument_output(partial).to_dict()}
+                raise bounded_adb_failure(exc, ctx.config.max_log_bytes) from exc
             if _MISSING_INSTRUMENTATION in output:
                 raise missing
             return {"device_id": key, **parse_instrument_output(output).to_dict()}
@@ -224,12 +252,18 @@ def register(server: MCPServer, ctx: GateContext) -> None:
         """Run a read-only diagnostic shell command on the device. Only commands starting with an
         entry of policy.shell_allowlist are accepted (by default: getprop, pm list, pm path,
         dumpsys, settings get, ls, ps, df, wm size, ip addr), without ; & | ` $ > < ( ) or newline.
-        Long output keeps its end."""
+        Long output keeps its end, also when the command fails."""
         key = normalize_device_id(device_id)
         tokens = check_shell_command(command, ctx.config.shell_allowlist)
 
         async def op(target: Target) -> str:
-            output = (await ctx.adb.shell(target, tokens)).text
+            try:
+                output = (await ctx.adb.shell(target, tokens)).text
+            except (AdbNotFound, AdbTimeout):
+                raise
+            except AdbError as exc:
+                # A non-zero exit may still carry a huge output (`ls -R /sdcard` on Android 11+).
+                raise bounded_adb_failure(exc, ctx.config.max_log_bytes) from exc
             return truncate_tail(output, ctx.config.max_log_bytes)
 
         return await device_call(ctx, key, op)

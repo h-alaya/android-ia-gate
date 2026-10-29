@@ -311,6 +311,12 @@ async def test_shell_output_truncated(client, ctx, fake, device):
         "",
         "   ",
         "getprop 'unbalanced",
+        # First word allowlisted, but not the whole entry: the allowlist matches on every word.
+        "pm uninstall com.example.app",
+        "settings put global adb_enabled 0",
+        "wm density 50",
+        "pm",
+        "ip link set wlan0 down",
     ],
 )
 async def test_shell_rejected(client, fake, device, command):
@@ -321,6 +327,64 @@ async def test_shell_rejected(client, fake, device, command):
 
     assert result.is_error
     assert fake.calls == []
+
+
+async def test_shell_failure_output_is_bounded(client, ctx, fake, device):
+    # `ls -R /sdcard` exits 1 on Android 11+ (Android/data is denied) but prints the whole listing.
+    lines = [f"/sdcard/DCIM/file_{i:06d}.jpg " + "z" * 80 for i in range(4000)]
+    raw = "\n".join(lines) + "\n"
+    assert len(raw.encode()) > ctx.config.max_log_bytes
+    fake.on(["shell", "ls"], stdout=raw, stderr="ls: /sdcard/Android/data: Permission denied\n",
+            returncode=1, serial=device)
+
+    result = await client.call_tool("shell", {"device_id": "VAL-042", "command": "ls -R /sdcard"})
+
+    assert result.is_error
+    message = text(result)
+    assert len(message.encode()) <= ctx.config.max_log_bytes + 500
+    assert "(code 1)" in message
+    assert "octets tronqués" in message
+    assert lines[-1] in message
+
+
+async def test_run_tests_partial_output_on_adb_failure_is_parsed(client, ctx, fake, device):
+    # USB unplugged mid-run: adb exits non-zero after a long partial status stream.
+    block = (
+        "INSTRUMENTATION_STATUS: class=com.example.LoginTest\n"
+        "INSTRUMENTATION_STATUS: test=t{i}\n"
+        "INSTRUMENTATION_STATUS_CODE: 1\n"
+        "INSTRUMENTATION_STATUS: class=com.example.LoginTest\n"
+        "INSTRUMENTATION_STATUS: test=t{i}\n"
+        "INSTRUMENTATION_STATUS_CODE: 0\n"
+    )
+    raw = "".join(block.format(i=i) for i in range(3000))
+    assert len(raw.encode()) > ctx.config.max_log_bytes
+    fake.on(["shell", "am", "instrument"], stdout=raw, stderr="error: device offline\n",
+            returncode=1, serial=device)
+
+    result = await client.call_tool(
+        "run_instrumented_tests", {"device_id": "VAL-042", "test_package": TEST_PKG}
+    )
+
+    assert not result.is_error, text(result)[:500]
+    out = data(result)
+    assert out["passed"] == 3000
+    assert out["completed"] is False
+    assert len(text(result).encode()) <= ctx.config.max_log_bytes
+
+
+async def test_run_tests_adb_failure_without_status_is_bounded(client, ctx, fake, device):
+    junk = "\n".join(f"noise {i:06d} " + "y" * 80 for i in range(4000)) + "\n"
+    fake.on(["shell", "am", "instrument"], stdout=junk, returncode=1, serial=device)
+
+    result = await client.call_tool(
+        "run_instrumented_tests", {"device_id": "VAL-042", "test_package": TEST_PKG}
+    )
+
+    assert result.is_error
+    message = text(result)
+    assert len(message.encode()) <= ctx.config.max_log_bytes + 500
+    assert "(code 1)" in message
 
 
 async def test_shell_rejection_lists_allowed_commands(client, fake, device):
