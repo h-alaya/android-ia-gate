@@ -224,6 +224,25 @@ def test_match_skips_bogus_serial_uses_android_id(reg):
     assert reg.match(Fingerprint(BOGUS, "id-one", "acme", "X1"), None, ()) == "VAL-1"
 
 
+def test_match_android_id_with_different_valid_serial_does_not_resolve(reg):
+    # Cloned ROM images can share android_id: two valid, different serials prove the probe is
+    # another device, so the android_id hit is rejected.
+    reg.enroll("VAL-1", Fingerprint("SERIALAAAA1", "cloned-id", "acme", "X1"), "", NOW)
+    clone = Fingerprint("SERIALBBBB2", "cloned-id", "acme", "X1")
+    assert reg.match(clone, None, ()) is None
+
+
+def test_enroll_android_id_clone_under_new_id_succeeds(reg):
+    original = Fingerprint("SERIALAAAA1", "cloned-id", "acme", "X1")
+    clone = Fingerprint("SERIALBBBB2", "cloned-id", "acme", "X1")
+    reg.enroll("VAL-1", original, "", NOW)
+    record = reg.enroll("VAL-2", clone, "", NOW)
+    assert record.fingerprint == clone
+    assert reg.get("VAL-1").fingerprint == original
+    assert reg.match(original, None, ()) == "VAL-1"
+    assert reg.match(clone, None, ()) == "VAL-2"
+
+
 def test_match_bogus_serial_alone_does_not_match(reg):
     reg.enroll("VAL-1", Fingerprint(BOGUS, "id-one", "acme", "X1"), "", NOW)
     assert reg.match(Fingerprint(BOGUS, "id-other", "acme", "X1"), None, ()) is None

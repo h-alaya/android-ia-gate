@@ -44,11 +44,15 @@ def _android_ids_conflict(a: Fingerprint, b: Fingerprint) -> bool:
     return bool(a.android_id) and bool(b.android_id) and a.android_id != b.android_id
 
 
-def _contradicts(a: Fingerprint, b: Fingerprint) -> bool:
-    """True when a known identifier proves `a` and `b` are different devices."""
+def _contradicts(a: Fingerprint, b: Fingerprint, ambiguous_serials: Collection[str] = ()) -> bool:
+    """True when a known identifier proves `a` and `b` are different devices.
+
+    A serialno shared by several connected devices (`ambiguous_serials`) is not valid (spec §4)
+    and therefore proves nothing.
+    """
     serials_differ = (
-        is_valid_serialno(a.serialno, ())
-        and is_valid_serialno(b.serialno, ())
+        is_valid_serialno(a.serialno, ambiguous_serials)
+        and is_valid_serialno(b.serialno, ambiguous_serials)
         and a.serialno != b.serialno
     )
     return serials_differ or _android_ids_conflict(a, b)
@@ -80,6 +84,8 @@ class DeviceRegistry:
         and different, or both android_ids known and different): stale marker of a retired or
         reassigned device. A serial match is rejected when both android_ids are known and differ
         (batch sibling or factory-reset device); resolution then falls through to android_id.
+        An android_id match is rejected when both serials are valid and differ (cloned ROM image
+        sharing one android_id).
         """
         return self._match(self._load(), fingerprint, marker, ambiguous_serials)
 
@@ -166,7 +172,10 @@ class DeviceRegistry:
                 return found
         if fingerprint.android_id:
             found = unique(lambda r: r.fingerprint.android_id == fingerprint.android_id)
-            if found is not None:
+            # Cloned ROM images can share one android_id: two valid, different serials rule it out.
+            if found is not None and not _contradicts(
+                records[found].fingerprint, fingerprint, ambiguous_serials
+            ):
                 return found
         return None
 
