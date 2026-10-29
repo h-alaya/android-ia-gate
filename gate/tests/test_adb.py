@@ -12,6 +12,9 @@ from ia_gate.adb import (
     AdbResult,
     AdbTimeout,
     InstallError,
+    TransportId,
+    _parse_devices,
+    duplicate_serials,
     subprocess_runner,
 )
 
@@ -40,11 +43,66 @@ def test_adb_result_text_decodes_with_replacement():
 async def test_devices_parses_usb_wifi_unauthorized(fake, adb):
     fake.on(["devices", "-l"], stdout=DEVICES_OUTPUT)
     assert await adb.devices() == [
-        AdbDevice("R58M12ABCDE", "device", "SM T505"),
-        AdbDevice("192.168.1.50:5555", "device", "VAL 200"),
-        AdbDevice("emulator-5554", "unauthorized", None),
+        AdbDevice("R58M12ABCDE", "device", "SM T505", 1),
+        AdbDevice("192.168.1.50:5555", "device", "VAL 200", 2),
+        AdbDevice("emulator-5554", "unauthorized", None, 3),
     ]
     assert fake.calls == [["adb", "devices", "-l"]]
+
+
+def test_parse_devices_keeps_distinct_transport_ids_for_shared_serial():
+    devices = _parse_devices(
+        "List of devices attached\n"
+        "0123456789ABCDEF       device usb:1-1 product:t model:TAB_X device:t transport_id:5\n"
+        "0123456789ABCDEF       device usb:1-2 product:t model:TAB_X device:t transport_id:6\n"
+    )
+    assert [d.serial for d in devices] == ["0123456789ABCDEF", "0123456789ABCDEF"]
+    assert [d.transport_id for d in devices] == [5, 6]
+    assert devices[0] != devices[1]
+
+
+def test_parse_devices_without_transport_id():
+    assert _parse_devices("List of devices attached\nABC device\nDEF device transport_id:x\n") == [
+        AdbDevice("ABC", "device", None),
+        AdbDevice("DEF", "device", None),
+    ]
+
+
+def test_duplicate_serials_and_target():
+    a = AdbDevice("0123456789ABCDEF", "device", None, 5)
+    b = AdbDevice("0123456789ABCDEF", "device", None, 6)
+    c = AdbDevice("R58M12ABCDE", "device", None, 7)
+    old = AdbDevice("0123456789ABCDEF", "device", None)
+    duplicated = duplicate_serials([a, b, c])
+    assert duplicated == {"0123456789ABCDEF"}
+    assert a.target(duplicated) == TransportId(5)
+    assert b.target(duplicated) == TransportId(6)
+    assert c.target(duplicated) == "R58M12ABCDE"
+    assert c.target() == "R58M12ABCDE"
+    assert old.target(duplicated) == "0123456789ABCDEF"  # no transport id: adb will refuse
+    assert str(TransportId(5)) == "transport_id:5"
+
+
+async def test_commands_address_transport_id_with_dash_t(fake, adb):
+    fake.on(["shell", "getprop"], stdout="v\n")
+    fake.on(["exec-out", "screencap", "-p"], stdout=b"\x89PNG")
+    fake.on(["install"], stdout="Success\n")
+    fake.on(["uninstall", "com.example.app"], stdout="Success\n")
+    target = TransportId(6)
+    assert await adb.getprop(target, "ro.serialno") == "v"
+    assert fake.calls[-1] == ["adb", "-t", "6", "shell", "getprop", "ro.serialno"]
+    await adb.exec_out(target, ["screencap", "-p"])
+    assert fake.calls[-1] == ["adb", "-t", "6", "exec-out", "screencap", "-p"]
+    await adb.install(target, Path("/apks/app.apk"))
+    assert fake.calls[-1] == ["adb", "-t", "6", "install", "-r", "/apks/app.apk"]
+    await adb.uninstall(target, "com.example.app")
+    assert fake.calls[-1] == ["adb", "-t", "6", "uninstall", "com.example.app"]
+
+
+async def test_shell_error_names_transport_id(fake, adb):
+    fake.on(["shell", "cat"], returncode=1, stderr="No such file")
+    with pytest.raises(AdbError, match="transport_id:6"):
+        await adb.shell(TransportId(6), ["cat", "/nope"])
 
 
 async def test_devices_skips_daemon_messages(fake, adb):
@@ -53,7 +111,7 @@ async def test_devices_skips_daemon_messages(fake, adb):
         stdout="* daemon not running; starting now at tcp:5037\n* daemon started successfully\n"
         "List of devices attached\nABC  offline transport_id:4\n",
     )
-    assert await adb.devices() == [AdbDevice("ABC", "offline", None)]
+    assert await adb.devices() == [AdbDevice("ABC", "offline", None, 4)]
 
 
 async def test_shell_quotes_arguments(fake, adb):
@@ -144,6 +202,14 @@ async def test_fake_runner_serial_specific_response_wins(fake, adb):
     fake.on(["shell", "getprop", "ro.serialno"], stdout="FOR-A", serial="A")
     assert await adb.getprop("A", "ro.serialno") == "FOR-A"
     assert await adb.getprop("B", "ro.serialno") == "GENERIC"
+
+
+async def test_fake_runner_transport_id_specific_response(fake, adb):
+    fake.on(["shell", "getprop", "ro.serialno"], stdout="GENERIC")
+    fake.on(["shell", "getprop", "ro.serialno"], stdout="FOR-T5", serial=TransportId(5))
+    assert await adb.getprop(TransportId(5), "ro.serialno") == "FOR-T5"
+    assert await adb.getprop(TransportId(6), "ro.serialno") == "GENERIC"
+    assert await adb.getprop("transport_id:5", "ro.serialno") == "GENERIC"
 
 
 async def test_subprocess_runner_ok():

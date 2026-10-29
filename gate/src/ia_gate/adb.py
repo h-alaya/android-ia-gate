@@ -3,6 +3,11 @@
 Every adb invocation goes through an injected `Runner`, so tests can replay recorded
 adb output without a real device. Arguments sent to `adb shell` / `adb exec-out` are
 `shlex.quote`d because the device-side shell re-parses them.
+
+Per-device commands take a `Target`: an adb serial (`adb -s SERIAL`) or a `TransportId`
+(`adb -t N`). The latter is needed when several connected devices share the same adb serial
+(e.g. a batch of tablets all reporting `0123456789ABCDEF` over USB): adb refuses
+`-s SERIAL` with "more than one device" in that case.
 """
 
 from __future__ import annotations
@@ -10,7 +15,8 @@ from __future__ import annotations
 import asyncio
 import re
 import shlex
-from collections.abc import Awaitable, Callable, Sequence
+from collections import Counter
+from collections.abc import Awaitable, Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -104,10 +110,42 @@ async def subprocess_runner(args: Sequence[str], timeout: float) -> AdbResult:
 
 
 @dataclass(frozen=True)
+class TransportId:
+    """An adb transport id (`transport_id:N` in `adb devices -l`), addressed with `adb -t N`."""
+
+    value: int
+
+    def __str__(self) -> str:
+        return f"transport_id:{self.value}"
+
+
+Target = str | TransportId
+
+
+def _target_args(target: Target) -> list[str]:
+    if isinstance(target, TransportId):
+        return ["-t", str(target.value)]
+    return ["-s", target]
+
+
+@dataclass(frozen=True)
 class AdbDevice:
     serial: str
     state: str
     model: str | None
+    transport_id: int | None = None
+
+    def target(self, duplicated_serials: Collection[str] = ()) -> Target:
+        """How to address this device: by transport id when its serial is not unique."""
+        if self.serial in duplicated_serials and self.transport_id is not None:
+            return TransportId(self.transport_id)
+        return self.serial
+
+
+def duplicate_serials(devices: Iterable[AdbDevice]) -> frozenset[str]:
+    """adb serials listed more than once (`adb -s` is ambiguous for them)."""
+    counts = Counter(device.serial for device in devices)
+    return frozenset(serial for serial, count in counts.items() if count > 1)
 
 
 _INSTALL_FAILURE_RE = re.compile(r"Failure \[([A-Z0-9_]+)")
@@ -134,10 +172,14 @@ def _parse_devices(text: str) -> list[AdbDevice]:
         else:
             state = rest[0]
         model = None
+        transport_id = None
         for token in rest:
             if token.startswith("model:"):
                 model = token.removeprefix("model:").replace("_", " ") or None
-        devices.append(AdbDevice(serial, state, model))
+            elif token.startswith("transport_id:"):
+                value = token.removeprefix("transport_id:")
+                transport_id = int(value) if value.isdecimal() else None
+        devices.append(AdbDevice(serial, state, model, transport_id))
     return devices
 
 
@@ -156,9 +198,9 @@ class AdbClient:
             raise AdbError(f"`adb devices` a échoué (code {result.returncode}) : {_output(result)}")
         return _parse_devices(result.text)
 
-    async def shell(self, serial: str, args: Sequence[str], timeout: float | None = None) -> AdbResult:
+    async def shell(self, serial: Target, args: Sequence[str], timeout: float | None = None) -> AdbResult:
         quoted = [shlex.quote(arg) for arg in args]
-        result = await self._run(["-s", serial, "shell", *quoted], timeout)
+        result = await self._run([*_target_args(serial), "shell", *quoted], timeout)
         if result.returncode != 0:
             raise AdbError(
                 f"Commande `{' '.join(args)}` échouée sur {serial} (code {result.returncode}) : "
@@ -166,9 +208,9 @@ class AdbClient:
             )
         return result
 
-    async def exec_out(self, serial: str, args: Sequence[str]) -> bytes:
+    async def exec_out(self, serial: Target, args: Sequence[str]) -> bytes:
         quoted = [shlex.quote(arg) for arg in args]
-        result = await self._run(["-s", serial, "exec-out", *quoted])
+        result = await self._run([*_target_args(serial), "exec-out", *quoted])
         if result.returncode != 0:
             raise AdbError(
                 f"Commande `{' '.join(args)}` échouée sur {serial} (code {result.returncode}) : "
@@ -176,11 +218,11 @@ class AdbClient:
             )
         return result.stdout
 
-    async def getprop(self, serial: str, name: str) -> str:
+    async def getprop(self, serial: Target, name: str) -> str:
         return (await self.shell(serial, ["getprop", name])).text.strip()
 
-    async def install(self, serial: str, apk_path: Path, replace: bool = True) -> None:
-        args = ["-s", serial, "install"]
+    async def install(self, serial: Target, apk_path: Path, replace: bool = True) -> None:
+        args = [*_target_args(serial), "install"]
         if replace:
             args.append("-r")
         args.append(str(apk_path))
@@ -196,8 +238,8 @@ class AdbClient:
                 f"{output or 'aucune sortie'}"
             )
 
-    async def uninstall(self, serial: str, package: str) -> None:
-        result = await self._run(["-s", serial, "uninstall", package])
+    async def uninstall(self, serial: Target, package: str) -> None:
+        result = await self._run([*_target_args(serial), "uninstall", package])
         output = _output(result)
         if result.returncode != 0 or "Failure" in output:
             raise AdbError(
