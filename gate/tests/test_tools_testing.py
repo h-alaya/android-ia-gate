@@ -1,4 +1,5 @@
 import asyncio
+import json
 import shlex
 from pathlib import Path
 
@@ -9,6 +10,8 @@ from ia_gate.adb import AdbTimeout
 from ia_gate.config import DEFAULT_SHELL_ALLOWLIST
 from ia_gate.identity import Fingerprint
 from ia_gate.tools.testing import (
+    MAX_FAILURES,
+    STACK_MAX_CHARS,
     InstrumentResult,
     check_shell_command,
     instrumentation_targets,
@@ -134,6 +137,45 @@ def test_instrument_result_to_dict():
     assert set(as_dict) == {"passed", "failed", "failures", "completed", "raw_tail"}
 
 
+def failing_suite(count: int, frames: int = 150) -> str:
+    """`count` failing tests, each with a long stack trace (e.g. a crash in `@Before`)."""
+    blocks = []
+    for i in range(count):
+        stack = "java.lang.SecurityException: Permission denial\n" + "".join(
+            f"\tat com.example.deep.Frame{j}.call(Frame{j}.java:{j})\n" for j in range(frames)
+        )
+        blocks.append(
+            f"INSTRUMENTATION_STATUS: class=com.example.T{i}\n"
+            f"INSTRUMENTATION_STATUS: test=t\n"
+            "INSTRUMENTATION_STATUS_CODE: 1\n"
+            f"INSTRUMENTATION_STATUS: class=com.example.T{i}\n"
+            f"INSTRUMENTATION_STATUS: stack={stack}"
+            f"INSTRUMENTATION_STATUS: test=t\n"
+            "INSTRUMENTATION_STATUS_CODE: -2\n"
+        )
+    return "".join(blocks) + "INSTRUMENTATION_CODE: -1\n"
+
+
+def test_parse_instrument_bounds_failures_and_stacks():
+    result = parse_instrument_output(failing_suite(500))
+
+    assert result.failed == 500
+    assert len(result.failures) == MAX_FAILURES
+    assert result.failures[0]["test"] == "com.example.T0#t"
+    for failure in result.failures:
+        assert failure["stack"].startswith("java.lang.SecurityException: Permission denial")
+        assert len(failure["stack"]) <= STACK_MAX_CHARS + 100
+        assert "caractères tronqués" in failure["stack"]
+    assert result.completed is True
+
+
+def test_parse_instrument_short_stack_kept_whole():
+    result = parse_instrument_output(failing_suite(1, frames=3))
+
+    assert "tronqués" not in result.failures[0]["stack"]
+    assert result.failures[0]["stack"].endswith("Frame2.java:2)")
+
+
 # --- run_instrumented_tests --------------------------------------------------------------------
 
 
@@ -203,14 +245,36 @@ async def test_run_tests_timeout_is_actionable(client, bench, fake, device):
     assert "VAL-042" in text(result)
 
 
+async def test_run_tests_many_long_failures_result_is_bounded(client, ctx, fake, device):
+    raw = failing_suite(500)
+    assert len(raw.encode()) > 10 * ctx.config.max_log_bytes
+    fake.on(["shell", "am", "instrument"], stdout=raw, serial=device)
+
+    result = await client.call_tool(
+        "run_instrumented_tests", {"device_id": "VAL-042", "test_package": TEST_PKG}
+    )
+
+    assert not result.is_error, text(result)[:500]
+    out = data(result)
+    assert out["failed"] == 500
+    assert out["completed"] is True
+    assert len(out["failures"]) == MAX_FAILURES
+    assert len(json.dumps(out).encode()) <= ctx.config.max_log_bytes
+    assert len(text(result).encode()) <= ctx.config.max_log_bytes
+
+
 PM_LIST_INSTRUMENTATION = """\
 instrumentation:com.other.test/androidx.test.runner.AndroidJUnitRunner (target=com.other)
 instrumentation:com.example.test/androidx.test.runner.AndroidJUnitRunner (target=com.example)
 """
 
 
-def force_stops(fake):
-    return [call[-1] for call in fake.calls if call[3:6] == ["shell", "am", "force-stop"]]
+def force_stops(fake, serial=None):
+    return [
+        call[-1]
+        for call in fake.calls
+        if call[3:6] == ["shell", "am", "force-stop"] and serial in (None, call[2])
+    ]
 
 
 def time_out_instrument(bench, order):
@@ -242,6 +306,7 @@ async def test_run_tests_timeout_force_stops_instrumentation(client, bench, fake
 
     assert result.is_error
     assert "30 s" in text(result)
+    assert "arrêtée par am force-stop" in text(result)
     assert sorted(force_stops(fake)) == ["com.example", TEST_PKG]
     instrument_index = next(i for i, call in enumerate(order) if "instrument" in call and "am" in call)
     stop_indexes = [i for i, call in enumerate(order) if "force-stop" in call]
@@ -261,6 +326,67 @@ async def test_run_tests_timeout_cleanup_failure_keeps_timeout_error(client, ben
     assert "expirés après 30 s" in text(result)
     assert "timeout_s" in text(result)
     assert force_stops(fake) == [TEST_PKG]
+    # The run may still drive the device: never claim it was stopped.
+    assert "arrêtée par am force-stop" not in text(result)
+    assert "stop_app" in text(result)
+    assert TEST_PKG in text(result)
+
+
+WIFI = "192.168.1.50:5555"
+
+
+def reconnect_during_run(bench, fake, new_serial):
+    """While `am instrument` runs, the device leaves its USB serial (`new_serial` set: it is now
+    reachable there; None: it is gone), then the run times out."""
+    real = bench.fake
+
+    async def timing_out(args, timeout):
+        if "instrument" in args:
+            if new_serial is not None:
+                bench.fake = real  # `add` registers its answers on the FakeRunner
+                bench.add(new_serial, FP_A, marker="VAL-042")
+                bench.fake = timing_out
+            fake.on(["devices", "-l"], stdout="List of devices attached\n" + (
+                f"{new_serial}\tdevice product:p model:SM-A505F device:d transport_id:9\n"
+                if new_serial is not None else ""
+            ))
+            raise AdbTimeout("Commande adb expirée")
+        return await real(args, timeout)
+
+    bench.fake = timing_out
+
+
+async def test_run_tests_timeout_cleanup_resolves_device_again(client, bench, fake, device):
+    for serial in (device, WIFI):
+        fake.on(["shell", "pm", "list", "instrumentation"], stdout=PM_LIST_INSTRUMENTATION, serial=serial)
+        fake.on(["shell", "am", "force-stop"], serial=serial)
+    reconnect_during_run(bench, fake, WIFI)
+
+    result = await client.call_tool(
+        "run_instrumented_tests", {"device_id": "VAL-042", "test_package": TEST_PKG, "timeout_s": 30}
+    )
+
+    assert result.is_error
+    assert force_stops(fake, device) == []
+    assert sorted(force_stops(fake, WIFI)) == ["com.example", TEST_PKG]
+    assert "arrêtée par am force-stop" in text(result)
+
+
+async def test_run_tests_timeout_device_gone_skips_cleanup(client, bench, fake, device):
+    fake.on(["shell", "pm", "list", "instrumentation"], stdout=PM_LIST_INSTRUMENTATION, serial=device)
+    fake.on(["shell", "am", "force-stop"], serial=device)
+    reconnect_during_run(bench, fake, None)
+
+    result = await client.call_tool(
+        "run_instrumented_tests", {"device_id": "VAL-042", "test_package": TEST_PKG, "timeout_s": 30}
+    )
+
+    assert result.is_error
+    assert force_stops(fake) == []
+    message = text(result)
+    assert "expirés après 30 s" in message
+    assert "arrêtée par am force-stop" not in message
+    assert "stop_app" in message
 
 
 async def test_run_tests_cancelled_force_stops_instrumentation(server, fake, device):

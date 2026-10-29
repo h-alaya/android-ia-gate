@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_RUNNER = "androidx.test.runner.AndroidJUnitRunner"
 RAW_TAIL_CHARS = 4000
+# Bounds of the returned failures: a whole suite failing for one reason (crash in `@Before`,
+# missing permission) would otherwise return megabytes of stacks. `failed` stays exact.
+MAX_FAILURES = 50
+STACK_MAX_CHARS = 2000
 
 # `INSTRUMENTATION_STATUS_CODE` values of a test status block (androidx.test / JUnit runner).
 _CODE_OK = 0
@@ -74,6 +78,13 @@ class InstrumentResult:
         return asdict(self)
 
 
+def _bound_stack(stack: str) -> str:
+    """The head of `stack` (exception and top frames), at most `STACK_MAX_CHARS` chars plus a notice."""
+    if len(stack) <= STACK_MAX_CHARS:
+        return stack
+    return f"{stack[:STACK_MAX_CHARS]}\n[… {len(stack) - STACK_MAX_CHARS} caractères tronqués]"
+
+
 def parse_instrument_output(text: str) -> InstrumentResult:
     """Parse the output of `am instrument -w -r`.
 
@@ -81,8 +92,12 @@ def parse_instrument_output(text: str) -> InstrumentResult:
     spanning several lines) closed by `INSTRUMENTATION_STATUS_CODE`: `1` start, `0` ok, `-2`
     assertion failure, `-1` error. A run that reached its end prints `INSTRUMENTATION_CODE: -1`;
     without it the instrumentation crashed or was killed.
+
+    `failed` counts every failure; `failures` keeps the first `MAX_FAILURES`, each stack cut to
+    its first `STACK_MAX_CHARS` chars.
     """
     passed = 0
+    failed = 0
     failures: list[dict] = []
     completed = False
     status: dict[str, str] = {}
@@ -101,9 +116,11 @@ def parse_instrument_output(text: str) -> InstrumentResult:
             if code == _CODE_OK:
                 passed += 1
             elif code in (_CODE_FAILURE, _CODE_ERROR):
-                test = f"{status.get('class', '?')}#{status.get('test', '?')}"
-                stack = status.get("stack") or status.get("stream", "")
-                failures.append({"test": test, "stack": stack.strip()})
+                failed += 1
+                if len(failures) < MAX_FAILURES:
+                    test = f"{status.get('class', '?')}#{status.get('test', '?')}"
+                    stack = status.get("stack") or status.get("stream", "")
+                    failures.append({"test": test, "stack": _bound_stack(stack.strip())})
             status = {}
             current_key = None
             continue
@@ -120,7 +137,7 @@ def parse_instrument_output(text: str) -> InstrumentResult:
 
     return InstrumentResult(
         passed=passed,
-        failed=len(failures),
+        failed=failed,
         failures=failures,
         completed=completed,
         raw_tail=text[-RAW_TAIL_CHARS:],
@@ -191,20 +208,34 @@ def instrumentation_targets(text: str, test_package: str) -> list[str]:
     return targets
 
 
-async def stop_instrumentation(ctx: GateContext, target: Target, test_package: str) -> None:
-    """Best effort: force-stop the package under test and `test_package` on the device.
+async def stop_instrumentation(ctx: GateContext, device_id: str, test_package: str) -> bool:
+    """Best effort: force-stop the package under test and `test_package` on `device_id`.
 
     Killing the host-side `am instrument -w` does not stop the instrumentation on the device: the
-    tests would keep driving the UI after the device lock is released. Never raises (except on
-    cancellation of this cleanup itself), so the caller's original error is kept; shielded from
-    the cancellation of the enclosing call so that it also runs when the MCP call is cancelled.
+    tests would keep driving the UI after the device lock is released. The caller holds the device
+    lock; the device is resolved again because the target of the run may be stale after a long
+    run (another device now sharing its serial, a transport id reused after an adb restart). If
+    the device no longer resolves, nothing is stopped.
+
+    Returns True only if every force-stop succeeded. Never raises (except on cancellation of this
+    cleanup itself), so the caller's original error is kept; shielded from the cancellation of the
+    enclosing call so that it also runs when the MCP call is cancelled.
     """
+    stopped = False
     with anyio.CancelScope(shield=True), anyio.move_on_after(STOP_TIMEOUT_S):
+        try:
+            target = await ctx.resolver.resolve(device_id)
+        except Exception:
+            logger.warning("%s introuvable : am force-stop %s non lancé", device_id, test_package,
+                           exc_info=True)
+            return False
+        complete = True
         packages: list[str] = []
         try:
             listing = (await ctx.adb.shell(target, ["pm", "list", "instrumentation"])).text
             packages = instrumentation_targets(listing, test_package)
         except Exception:
+            complete = False  # the package under test is unknown: it may keep running
             logger.warning("Lecture de pm list instrumentation impossible sur %s", target, exc_info=True)
         if test_package not in packages:
             packages.append(test_package)
@@ -213,7 +244,10 @@ async def stop_instrumentation(ctx: GateContext, target: Target, test_package: s
                 check_package(package)
                 await ctx.adb.shell(target, ["am", "force-stop", package])
             except Exception:
+                complete = False
                 logger.warning("am force-stop %s impossible sur %s", package, target, exc_info=True)
+        stopped = complete
+    return stopped
 
 
 def _check_runner(runner: str) -> str:
@@ -250,7 +284,8 @@ def register(server: MCPServer, ctx: GateContext) -> None:
         timeout_s: int = 900,
     ) -> dict[str, Any]:
         """Run the instrumented tests of the installed test APK `test_package` (`am instrument -w -r`)
-        and return passed / failed counts, failures (test `Class#method` and stack trace), whether
+        and return passed / failed counts, failures (test `Class#method` and stack trace; at most
+        the first 50, stacks cut to their first 2000 chars, `failed` stays exact), whether
         the run completed (false: the app crashed or was killed) and the end of the raw output.
         `test_class` restricts the run to a class, a method (`Class#method`) or a comma-separated
         list. Install the app and its test APK first with install_apk."""
@@ -273,13 +308,20 @@ def register(server: MCPServer, ctx: GateContext) -> None:
             try:
                 output = (await ctx.adb.shell(target, args, timeout=timeout_s)).text
             except asyncio.CancelledError:
-                await stop_instrumentation(ctx, target, test_package)
+                await stop_instrumentation(ctx, key, test_package)
                 raise
             except AdbTimeout as exc:
-                await stop_instrumentation(ctx, target, test_package)
+                if await stop_instrumentation(ctx, key, test_package):
+                    raise ToolError(
+                        f"Tests instrumentés expirés après {timeout_s} s sur {key} (exécution arrêtée par "
+                        "am force-stop) : augmentez timeout_s ou limitez la campagne avec test_class."
+                    ) from exc
                 raise ToolError(
-                    f"Tests instrumentés expirés après {timeout_s} s sur {key} (exécution arrêtée par "
-                    "am force-stop) : augmentez timeout_s ou limitez la campagne avec test_class."
+                    f"Tests instrumentés expirés après {timeout_s} s sur {key}, et leur arrêt n'a pas pu "
+                    "être confirmé : ils tournent peut-être encore sur l'appareil. Avant de le réutiliser, "
+                    f"vérifiez-le avec list_devices puis lancez stop_app sur {test_package} et sur l'app "
+                    "testée (ou redémarrez l'appareil) ; augmentez ensuite timeout_s ou limitez la "
+                    "campagne avec test_class."
                 ) from exc
             except AdbNotFound:
                 raise
