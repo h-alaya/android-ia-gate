@@ -257,6 +257,14 @@ class DeviceResolver:
                     f"est {key}, acceptez la clé RSA sur son écran ou rebranchez-le."
                 )
             raise DeviceUnavailable(message)
+        online = [h for h in hits if h.state == "online"]
+        if online:
+            # A transport that is not online cannot receive commands (e.g. a dead Wi-Fi link adb still
+            # lists, identified only from cache): it must not block the device's working transport.
+            hits = online
+        elif len(hits) > 1:
+            # Nothing is reachable: report the state of the preferred (cable) transport.
+            hits = sorted(hits, key=lambda h: (h.is_network, h.address))[:1]
         if len(hits) > 1:
             maybe_same, proven = _same_transports(hits)
             if not proven:

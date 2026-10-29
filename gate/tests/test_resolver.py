@@ -251,6 +251,31 @@ async def test_same_device_over_usb_and_wifi_resolves_to_usb(bench):
     assert await bench.resolver.resolve("VAL-042") == "192.168.1.50:5555"
 
 
+async def test_stale_offline_wifi_does_not_block_usb(bench):
+    # Wi-Fi seen online, then the phone sleeps: adb keeps listing it `offline`; USB plugged in.
+    bench.registry.enroll("VAL-1", FP_A, "", NOW)
+    bench.devices(usb("192.168.1.50:5555", 2))
+    bench.device("192.168.1.50:5555", FP_A, marker="VAL-1")
+    assert await bench.resolver.resolve("VAL-1") == "192.168.1.50:5555"
+    bench.devices(state_line("192.168.1.50:5555", "offline", 2), usb("R58M12AAAAA", 1))
+    bench.device("R58M12AAAAA", FP_A, marker="VAL-1")
+    assert await bench.resolver.resolve("VAL-1") == "R58M12AAAAA"
+
+
+async def test_only_non_online_hits_reports_cable_state_first(bench):
+    # Both transports were seen online, then both went offline: no conflict, just not ready.
+    bench.registry.enroll("VAL-1", FP_A, "", NOW)
+    bench.devices(usb("R58M12AAAAA", 1), usb("192.168.1.50:5555", 2))
+    bench.device("R58M12AAAAA", FP_A, marker="VAL-1", boot_id="b-1")
+    bench.device("192.168.1.50:5555", FP_A, marker="VAL-1", boot_id="b-1")
+    assert await bench.resolver.resolve("VAL-1") == "R58M12AAAAA"
+    bench.devices(state_line("192.168.1.50:5555", "offline", 2), state_line("R58M12AAAAA", "offline", 1))
+    with pytest.raises(DeviceUnavailable) as exc:
+        await bench.resolver.resolve("VAL-1")
+    assert "VAL-1 est offline" in str(exc.value)
+    assert "Plusieurs" not in str(exc.value)
+
+
 async def test_same_identity_unproven_suggests_disconnecting_a_transport(bench):
     # Same serialno, android_id and marker but boot_id unreadable: maybe one device twice,
     # maybe a clone. Refuse, and do not only advise wiping the marker.
