@@ -111,10 +111,36 @@ def test_enroll_invalid_id_raises_value_error(reg):
 
 def test_match_prefers_marker(reg):
     reg.enroll("VAL-1", FP_A, "", NOW)
+    reg.enroll("VAL-2", Fingerprint(BOGUS, "", "samsung", "SM-A"), "", NOW)
+    # The serial says VAL-1 but the marker says VAL-2, whose record contradicts nothing in the
+    # probe (bogus serial, unknown android_id): the marker wins.
+    probe = Fingerprint(FP_A.serialno, "", "samsung", "SM-A")
+    assert reg.match(probe, None, ()) == "VAL-1"
+    assert reg.match(probe, "VAL-2", ()) == "VAL-2"
+    assert reg.match(probe, "val-2", ()) == "VAL-2"
+
+
+def test_match_marker_contradicted_by_fingerprint_is_ignored(reg):
+    reg.enroll("VAL-1", FP_A, "", NOW)
     reg.enroll("VAL-2", FP_B, "", NOW)
-    # Fingerprint says VAL-1 but the marker says VAL-2: the marker wins.
-    assert reg.match(FP_A, "VAL-2", ()) == "VAL-2"
-    assert reg.match(FP_A, "val-2", ()) == "VAL-2"
+    # Marker VAL-2 on a device whose serial and android_id are VAL-1's: stale marker.
+    assert reg.match(FP_A, "VAL-2", ()) == "VAL-1"
+    # One contradicting identifier is enough: a different valid serial...
+    assert reg.match(Fingerprint("R58M12CCCCC", "", "samsung", "SM-B"), "VAL-2", ()) is None
+    # ...or a different known android_id (batch sibling carrying a copied marker).
+    assert reg.match(Fingerprint(FP_B.serialno, "zzzz9999", "samsung", "SM-B"), "VAL-2", ()) is None
+    assert reg.match(Fingerprint(BOGUS, "zzzz9999", "samsung", "SM-B"), "VAL-2", ()) is None
+
+
+def test_match_stale_marker_after_remove_and_reenroll(reg):
+    old = Fingerprint("BATCH777", "id-one", "acme", "X1")
+    new = Fingerprint("NEW1", "id-new", "acme", "X1")
+    reg.enroll("VAL-1", old, "", NOW)
+    reg.remove("VAL-1")
+    reg.enroll("VAL-1", new, "", NOW)
+    # The retired device still carries marker VAL-1: it must not resolve to the new VAL-1.
+    assert reg.match(old, "VAL-1", ()) is None
+    assert reg.match(new, "VAL-1", ()) == "VAL-1"
 
 
 def test_match_unknown_marker_falls_back_to_fingerprint(reg):
@@ -155,13 +181,32 @@ def test_enroll_batch_sibling_under_new_id_succeeds(reg):
     assert reg.match(fp_b, None, ()) == "VAL-2"
 
 
-def test_reenroll_after_factory_reset_same_id_allowed(reg):
+def test_enroll_batch_sibling_cannot_take_existing_id(reg):
+    fp_a = Fingerprint("BATCH777", "id-one", "acme", "X1")
+    fp_b = Fingerprint("BATCH777", "id-two", "acme", "X1")
+    reg.enroll("VAL-1", fp_a, "", NOW)
+    with pytest.raises(RegistryError, match="VAL-1"):
+        reg.enroll("VAL-1", fp_b, "", NOW)
+    assert reg.get("VAL-1").fingerprint == fp_a
+    assert reg.match(fp_a, None, ()) == "VAL-1"
+    assert reg.match(fp_b, None, ()) is None
+
+
+def test_reenroll_after_factory_reset_requires_remove(reg):
+    # A factory-reset device (same serial, new android_id) cannot be told apart from a batch
+    # sibling: its old ID stays taken until the user removes it explicitly.
     reg.enroll("VAL-1", FP_A, "old", NOW)
     reset = Fingerprint(FP_A.serialno, "new-after-reset", "samsung", "SM-A")
     assert reg.match(reset, None, ()) is None
+    with pytest.raises(RegistryError) as exc_info:
+        reg.enroll("val-1", reset, "new", NOW)
+    message = str(exc_info.value)
+    assert "réinitialisé" in message
+    assert "retirez d'abord VAL-1" in message
+    assert reg.get("VAL-1").fingerprint == FP_A
+    reg.remove("VAL-1")
     record = reg.enroll("val-1", reset, "new", "2026-10-30T10:00:00+00:00")
     assert record.fingerprint == reset
-    assert record.enrolled_at == NOW
     assert reg.match(reset, None, ()) == "VAL-1"
 
 
@@ -185,11 +230,13 @@ def test_match_bogus_serial_alone_does_not_match(reg):
 
 
 def test_match_ambiguous_serial_uses_android_id(reg):
-    reg.enroll("VAL-1", Fingerprint("SHARED123", "id-one", "acme", "X1"), "", NOW)
-    assert reg.match(Fingerprint("SHARED123", "id-one", "acme", "X1"), None, ()) == "VAL-1"
+    # VAL-1's android_id is unknown, so nothing contradicts a serial match on SHARED123.
+    reg.enroll("VAL-1", Fingerprint("SHARED123", "", "acme", "X1"), "", NOW)
     reg.enroll("VAL-2", Fingerprint("OTHER456", "id-two", "acme", "X1"), "", NOW)
-    # The serial is shared by two connected devices: it is not used, android_id decides.
     probe = Fingerprint("SHARED123", "id-two", "acme", "X1")
+    # Serial not shared among connected devices: it decides.
+    assert reg.match(probe, None, ()) == "VAL-1"
+    # The serial is shared by two connected devices: it is not used, android_id decides.
     assert reg.match(probe, None, {"SHARED123"}) == "VAL-2"
 
 

@@ -74,7 +74,9 @@ unique stable** :
 3. **Marqueur** écrit sur l'équipement : `/data/local/tmp/.ia-gate-id` contient l'ID
    (inscriptible par l'utilisateur `shell`, survit aux redémarrages, effacé par un reset usine).
 4. **Résolution** d'un appareil connecté vers un ID, dans cet ordre :
-   1. marqueur présent **et** connu du registre → cet ID ;
+   1. marqueur présent **et** connu du registre → cet ID, sauf si l'enregistrement contredit
+      l'empreinte (deux `serialno` valides différents, ou deux `android_id` connus différents :
+      marqueur périmé d'un appareil retiré ou réattribué) : on passe alors au critère suivant ;
    2. sinon `serialno` *valide* correspondant à exactement un enregistrement → cet ID, sauf si
       les deux `android_id` sont connus et diffèrent (frère d'un lot partageant le serial, ou
       appareil réinitialisé) : on passe alors au critère suivant ;
@@ -84,8 +86,10 @@ unique stable** :
    Un `serialno` est **invalide** s'il est vide, `unknown`, `0123456789ABCDEF`, `0123456789`,
    ou partagé par au moins deux appareils connectés.
 
-   Un appareil réinitialisé (nouvel `android_id`, marqueur effacé) apparaît donc non enrôlé ;
-   il peut être ré-enrôlé sous son ancien ID, accepté car le `serialno` valide est le même.
+   Un appareil réinitialisé (nouvel `android_id`, marqueur effacé) apparaît donc non enrôlé.
+   Le registre ne peut pas le distinguer d'un frère de lot partageant le `serialno` : son
+   ancien ID reste attribué, et pour le ré-enrôler sous cet ID il faut d'abord retirer l'ID
+   du registre.
 5. Le **serial adb** (`R58M…` en USB, `ip:port` en Wi-Fi) n'est jamais un identifiant : il
    sert seulement à adresser la commande adb une fois l'ID résolu.
 
