@@ -22,6 +22,10 @@ State = Literal["online", "offline", "unauthorized", "disconnected"]
 
 _TRANSPORT_PREFIX = "transport_id:"
 
+# Deadline for identifying one online device during a scan. A device adb still lists as
+# `device` but that no longer answers (typically Wi-Fi) must not stall calls on the others.
+IDENTIFY_TIMEOUT_S = 8.0
+
 # One adb connection: the serial alone is not enough (shared serials), and a reconnect gets a
 # new transport id, so a device swapped behind the same serial is never served a stale cache.
 _ConnKey = tuple[str, int | None]
@@ -234,18 +238,25 @@ class DeviceResolver:
         return matches[0]
 
     async def _identify(self, device: AdbDevice, target: Target) -> Fingerprint | None:
-        """Fingerprint (cached per connection) and fresh marker of an online device; None if it fails."""
-        conn = _conn_key(device)
+        """Fingerprint (cached per connection) and fresh marker of an online device; None if it fails.
+
+        Bounded by `IDENTIFY_TIMEOUT_S`: a device that does not answer in time counts as offline
+        (cancelling the read kills the pending adb subprocess).
+        """
         try:
-            fingerprint = self._fingerprints.get(conn)
-            if fingerprint is None:
-                fingerprint = await read_fingerprint(self._adb, target)
-                self._fingerprints[conn] = fingerprint
-            self._markers[conn] = await read_marker(self._adb, target)
+            return await asyncio.wait_for(self._read_identity(device, target), IDENTIFY_TIMEOUT_S)
         except AdbNotFound:
             raise
-        except AdbError:
+        except (AdbError, TimeoutError):
             return None
+
+    async def _read_identity(self, device: AdbDevice, target: Target) -> Fingerprint:
+        conn = _conn_key(device)
+        fingerprint = self._fingerprints.get(conn)
+        if fingerprint is None:
+            fingerprint = await read_fingerprint(self._adb, target)
+            self._fingerprints[conn] = fingerprint
+        self._markers[conn] = await read_marker(self._adb, target)
         return fingerprint
 
     async def _scan(self) -> tuple[list[_Seen], dict[str, DeviceRecord]]:

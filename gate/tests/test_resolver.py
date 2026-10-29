@@ -318,3 +318,17 @@ async def test_lock_serializes_same_device(bench):
     start = time.monotonic()
     await asyncio.gather(hold("VAL-1"), hold("VAL-2"))
     assert time.monotonic() - start < 0.1
+
+
+async def test_hanging_device_does_not_delay_other_devices(bench, monkeypatch):
+    # A Wi-Fi device still listed as `device` but no longer answering: its shell calls hang.
+    monkeypatch.setattr("ia_gate.resolver.IDENTIFY_TIMEOUT_S", 0.2)
+    bench.registry.enroll("VAL-1", FP_A, "", NOW)
+    bench.devices(usb("R58A", 1), usb("192.168.1.60:5555", 2))
+    bench.device("R58A", FP_A, marker="VAL-1")
+    bench.fake.on(["shell"], delay=30, serial="192.168.1.60:5555")
+    start = time.monotonic()
+    assert await bench.resolver.resolve("VAL-1") == "R58A"
+    snapshot = await bench.resolver.snapshot()
+    assert time.monotonic() - start < 2
+    assert DeviceStatus(None, "192.168.1.60:5555", "offline", "", "SM X") in snapshot
