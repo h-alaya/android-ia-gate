@@ -125,8 +125,51 @@ def test_match_unknown_marker_falls_back_to_fingerprint(reg):
 def test_match_by_serial(reg):
     reg.enroll("VAL-1", FP_A, "", NOW)
     reg.enroll("VAL-2", FP_B, "", NOW)
-    fp = Fingerprint(FP_B.serialno, "changed-after-reset", "samsung", "SM-B")
+    assert reg.match(FP_B, None, ()) == "VAL-2"
+    # android_id unreadable: nothing contradicts the serial, which decides alone.
+    fp = Fingerprint(FP_B.serialno, "", "samsung", "SM-B")
     assert reg.match(fp, None, ()) == "VAL-2"
+
+
+def test_match_serial_with_conflicting_android_id_does_not_match(reg):
+    # Same valid serial but a different android_id: either a sibling of a batch sharing the
+    # serial, or the same device after a factory reset. Never resolve it to the record.
+    reg.enroll("VAL-1", FP_A, "", NOW)
+    fp = Fingerprint(FP_A.serialno, "changed-after-reset", "samsung", "SM-A")
+    assert reg.match(fp, None, ()) is None
+
+
+def test_match_batch_sibling_alone_does_not_resolve(reg):
+    reg.enroll("VAL-1", Fingerprint("BATCH777", "id-one", "acme", "X1"), "", NOW)
+    assert reg.match(Fingerprint("BATCH777", "id-two", "acme", "X1"), None, ()) is None
+
+
+def test_enroll_batch_sibling_under_new_id_succeeds(reg):
+    fp_a = Fingerprint("BATCH777", "id-one", "acme", "X1")
+    fp_b = Fingerprint("BATCH777", "id-two", "acme", "X1")
+    reg.enroll("VAL-1", fp_a, "", NOW)
+    record = reg.enroll("VAL-2", fp_b, "", NOW)
+    assert record.fingerprint == fp_b
+    assert reg.get("VAL-1").fingerprint == fp_a
+    assert reg.match(fp_a, None, ()) == "VAL-1"
+    assert reg.match(fp_b, None, ()) == "VAL-2"
+
+
+def test_reenroll_after_factory_reset_same_id_allowed(reg):
+    reg.enroll("VAL-1", FP_A, "old", NOW)
+    reset = Fingerprint(FP_A.serialno, "new-after-reset", "samsung", "SM-A")
+    assert reg.match(reset, None, ()) is None
+    record = reg.enroll("val-1", reset, "new", "2026-10-30T10:00:00+00:00")
+    assert record.fingerprint == reset
+    assert record.enrolled_at == NOW
+    assert reg.match(reset, None, ()) == "VAL-1"
+
+
+def test_enroll_conflicting_device_without_shared_serial_still_raises(reg):
+    reg.enroll("VAL-1", FP_A, "", NOW)
+    other = Fingerprint("R58M12CCCCC", "cccc3333", "samsung", "SM-A")
+    with pytest.raises(RegistryError, match="VAL-1"):
+        reg.enroll("VAL-1", other, "", NOW)
 
 
 def test_match_skips_bogus_serial_uses_android_id(reg):
@@ -143,7 +186,7 @@ def test_match_bogus_serial_alone_does_not_match(reg):
 
 def test_match_ambiguous_serial_uses_android_id(reg):
     reg.enroll("VAL-1", Fingerprint("SHARED123", "id-one", "acme", "X1"), "", NOW)
-    assert reg.match(Fingerprint("SHARED123", "id-two", "acme", "X1"), None, ()) == "VAL-1"
+    assert reg.match(Fingerprint("SHARED123", "id-one", "acme", "X1"), None, ()) == "VAL-1"
     reg.enroll("VAL-2", Fingerprint("OTHER456", "id-two", "acme", "X1"), "", NOW)
     # The serial is shared by two connected devices: it is not used, android_id decides.
     probe = Fingerprint("SHARED123", "id-two", "acme", "X1")
@@ -164,8 +207,8 @@ def write_records(path, records):
 
 
 def test_match_serial_on_two_records_is_skipped(path, reg):
-    # A batch sharing one serialno: enrollment alone cannot produce this, but a hand-edited or
-    # older registry can; the serial criterion must then be skipped.
+    # A batch sharing one serialno (two siblings enrolled): the serial criterion hits two
+    # records and is skipped, android_id decides.
     write_records(
         path,
         {

@@ -40,6 +40,10 @@ class DeviceRecord:
         }
 
 
+def _android_ids_conflict(a: Fingerprint, b: Fingerprint) -> bool:
+    return bool(a.android_id) and bool(b.android_id) and a.android_id != b.android_id
+
+
 class DeviceRegistry:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -60,7 +64,11 @@ class DeviceRegistry:
     def match(
         self, fingerprint: Fingerprint, marker: str | None, ambiguous_serials: Collection[str]
     ) -> str | None:
-        """Gate ID of a connected device, in spec §4 order; a criterion hitting ≥ 2 records is skipped."""
+        """Gate ID of a connected device, in spec §4 order; a criterion hitting ≥ 2 records is skipped.
+
+        A serial match is rejected when both android_ids are known and differ (batch sibling or
+        factory-reset device); resolution then falls through to the android_id criterion.
+        """
         return self._match(self._load(), fingerprint, marker, ambiguous_serials)
 
     # -- mutations -----------------------------------------------------------------------------
@@ -75,7 +83,19 @@ class DeviceRegistry:
                 f"Cet appareil est déjà enrôlé sous l'ID {matched}. Utilisez {matched}, ou retirez "
                 f"d'abord {matched} du registre ({self.path}) avant de le ré-enrôler sous {device_id}."
             )
-        if existing is not None and matched != device_id and existing.fingerprint != fingerprint:
+        # Same valid serial as the record held by this ID: the device may have been factory-reset
+        # (new android_id, marker wiped), so re-enrolling it under its old ID is allowed.
+        same_serial = (
+            existing is not None
+            and is_valid_serialno(fingerprint.serialno, ())
+            and existing.fingerprint.serialno == fingerprint.serialno
+        )
+        if (
+            existing is not None
+            and matched != device_id
+            and not same_serial
+            and existing.fingerprint != fingerprint
+        ):
             raise RegistryError(
                 f"L'ID {device_id} est déjà attribué à un autre appareil "
                 f"({existing.fingerprint.manufacturer} {existing.fingerprint.model}, "
@@ -137,7 +157,8 @@ class DeviceRegistry:
 
         if is_valid_serialno(fingerprint.serialno, ambiguous_serials):
             found = unique(lambda r: r.fingerprint.serialno == fingerprint.serialno)
-            if found is not None:
+            # A batch can share one serialno: a known, different android_id rules the record out.
+            if found is not None and not _android_ids_conflict(records[found].fingerprint, fingerprint):
                 return found
         if fingerprint.android_id:
             found = unique(lambda r: r.fingerprint.android_id == fingerprint.android_id)

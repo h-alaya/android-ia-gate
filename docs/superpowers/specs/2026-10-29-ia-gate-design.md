@@ -75,12 +75,17 @@ unique stable** :
    (inscriptible par l'utilisateur `shell`, survit aux redémarrages, effacé par un reset usine).
 4. **Résolution** d'un appareil connecté vers un ID, dans cet ordre :
    1. marqueur présent **et** connu du registre → cet ID ;
-   2. sinon `serialno` *valide* correspondant à exactement un enregistrement → cet ID ;
+   2. sinon `serialno` *valide* correspondant à exactement un enregistrement → cet ID, sauf si
+      les deux `android_id` sont connus et diffèrent (frère d'un lot partageant le serial, ou
+      appareil réinitialisé) : on passe alors au critère suivant ;
    3. sinon `android_id` correspondant à exactement un enregistrement → cet ID ;
    4. sinon : non enrôlé.
 
    Un `serialno` est **invalide** s'il est vide, `unknown`, `0123456789ABCDEF`, `0123456789`,
    ou partagé par au moins deux appareils connectés.
+
+   Un appareil réinitialisé (nouvel `android_id`, marqueur effacé) apparaît donc non enrôlé ;
+   il peut être ré-enrôlé sous son ancien ID, accepté car le `serialno` valide est le même.
 5. Le **serial adb** (`R58M…` en USB, `ip:port` en Wi-Fi) n'est jamais un identifiant : il
    sert seulement à adresser la commande adb une fois l'ID résolu.
 
