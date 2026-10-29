@@ -118,3 +118,33 @@ async def test_bearer_middleware_passes_lifespan_through():
     middleware = BearerTokenMiddleware(app, token=TOKEN)
     await middleware({"type": "lifespan"}, None, None)
     assert seen == ["lifespan"]
+
+
+async def test_http_wildcard_bind_rejects_lan_host_with_french_hint(server, cfg, with_token):
+    wildcard = replace(cfg, host="0.0.0.0")
+    async with http_client(server, wildcard, host="192.168.1.10") as c:
+        response = await c.post(
+            "/mcp", json=INITIALIZE, headers={**MCP_HEADERS, "Authorization": f"Bearer {TOKEN}"}
+        )
+    assert response.status_code == 421
+    body = response.json()
+    assert body["error"] == "invalid_host"
+    assert "server.allowed_hosts" in body["message"]
+    assert "192.168.1.10" in body["message"]
+
+
+@pytest.mark.parametrize("client_host", ["192.168.1.10", "gatepc.local"])
+async def test_http_allowed_hosts_accepts_ip_and_hostname(server, cfg, with_token, client_host):
+    wildcard = replace(cfg, host="0.0.0.0", allowed_hosts=("192.168.1.10", "gatepc.local"))
+    async with http_client(server, wildcard, host=client_host) as c:
+        response = await c.post(
+            "/mcp", json=INITIALIZE, headers={**MCP_HEADERS, "Authorization": f"Bearer {TOKEN}"}
+        )
+    assert response.status_code == 200, response.text
+
+
+async def test_http_host_check_runs_after_auth(server, cfg, with_token):
+    # Unauthenticated clients must not learn the allowlist from the 421 hint.
+    async with http_client(server, cfg, host="evil.example") as c:
+        response = await c.post("/mcp", json=INITIALIZE, headers=MCP_HEADERS)
+    assert response.status_code == 401

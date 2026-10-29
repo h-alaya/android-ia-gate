@@ -129,7 +129,10 @@ traités en parallèle.
   démarrage** si aucun token n'est configuré.
 - **Auth HTTP** : `Authorization: Bearer <token>` comparé en temps constant ; token lu
   depuis la variable d'environnement nommée dans la config (`IA_GATE_TOKEN` par défaut).
-  Protection DNS-rebinding du SDK activée avec `allowed_hosts` = hôte(s) configuré(s).
+  Protection DNS-rebinding du SDK activée avec `allowed_hosts` = hôte(s) configuré(s)
+  (`server.host`, sauf `0.0.0.0`/`::`, plus `server.allowed_hosts`). Avec `host = "0.0.0.0"`,
+  renseigner `server.allowed_hosts` (IP LAN et/ou nom du PC), sinon les clients reçoivent un 421
+  expliquant quoi ajouter.
 - **APK** : `apk_path` doit se résoudre (chemin réel, liens résolus) sous un des
   `policy.apk_dirs`, se terminer par `.apk` et exister.
 - **Shell** : la commande est découpée (`shlex`) ; refusée si elle contient un
@@ -146,6 +149,7 @@ traités en parallèle.
 host = "127.0.0.1"
 port = 8765
 token_env = "IA_GATE_TOKEN"
+# allowed_hosts = ["192.168.1.10", "gatepc.local"]  # noms/IP acceptés dans l'en-tête Host
 
 [adb]
 path = "adb"

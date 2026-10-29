@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import tomllib
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from typing import Any
 
 DEFAULT_CONFIG_PATH = Path("~/.ia-gate/config.toml")
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+# Binds that listen on every interface: no single Host header value matches them.
+WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", ""})
 
 DEFAULT_SHELL_ALLOWLIST = (
     "getprop",
@@ -41,6 +44,8 @@ class GateConfig:
     apk_dirs: tuple[Path, ...] = (Path("~/ia-gate-apks").expanduser(),)
     shell_allowlist: tuple[str, ...] = DEFAULT_SHELL_ALLOWLIST
     max_log_bytes: int = 200_000
+    # Extra names/IPs (no port) clients may use in the Host header (DNS-rebinding allowlist).
+    allowed_hosts: tuple[str, ...] = ()
 
     def token(self) -> str | None:
         """Return the bearer token from the environment, or None if unset/empty."""
@@ -85,6 +90,31 @@ def _str_list(
     return tuple(value)
 
 
+def _allowed_hosts(data: dict[str, Any]) -> tuple[str, ...]:
+    hosts = _str_list(data, "server", "allowed_hosts", ())
+    assert hosts is not None
+    for host in hosts:
+        if not _is_valid_allowed_host(host):
+            raise ConfigError(
+                f"Configuration invalide : server.allowed_hosts contient {host!r}. "
+                f"Indiquez uniquement des noms d'hôte ou adresses IP de la gate, sans port ni schéma "
+                f'(ex. ["192.168.1.10", "gatepc.local"]).'
+            )
+    return hosts
+
+
+def _is_valid_allowed_host(host: str) -> bool:
+    if host in WILDCARD_HOSTS or any(c.isspace() or c in "/@[]" for c in host):
+        return False
+    if ":" in host:
+        # Only an IPv6 literal may contain a colon; a port is appended by the gate.
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            return False
+    return True
+
+
 def load_config(path: Path | None = None) -> GateConfig:
     """Load the gate configuration; a missing file yields the defaults. Unknown keys are ignored."""
     cfg_path = (path if path is not None else DEFAULT_CONFIG_PATH).expanduser()
@@ -115,6 +145,7 @@ def load_config(path: Path | None = None) -> GateConfig:
         apk_dirs=tuple(_expand(p) for p in apk_dirs) if apk_dirs is not None else d.apk_dirs,
         shell_allowlist=_str_list(data, "policy", "shell_allowlist", d.shell_allowlist),
         max_log_bytes=_get(data, "policy", "max_log_bytes", int, d.max_log_bytes),
+        allowed_hosts=_allowed_hosts(data),
     )
 
 

@@ -30,3 +30,18 @@ def test_lan_bind_with_token_ok(tmp_path, monkeypatch):
     monkeypatch.setenv("IA_GATE_TOKEN", "s3cret")
     (tmp_path / "c.toml").write_text('[server]\nhost = "0.0.0.0"\n')
     validate_for_http(load_config(tmp_path / "c.toml"))  # no raise
+
+
+def test_allowed_hosts_loaded_from_server_section(tmp_path):
+    toml = '[server]\nallowed_hosts = ["192.168.1.10", "gatepc.local", "fe80::1"]\n'
+    (tmp_path / "c.toml").write_text(toml)
+    cfg = load_config(tmp_path / "c.toml")
+    assert cfg.allowed_hosts == ("192.168.1.10", "gatepc.local", "fe80::1")
+    assert load_config(tmp_path / "absent.toml").allowed_hosts == ()
+
+
+@pytest.mark.parametrize("entry", ["", "0.0.0.0", "gatepc.local:8765", "http://gatepc", "gate pc"])
+def test_allowed_hosts_invalid_entry_refused(tmp_path, entry):
+    (tmp_path / "c.toml").write_text(f'[server]\nallowed_hosts = ["{entry}"]\n')
+    with pytest.raises(ConfigError, match="server.allowed_hosts"):
+        load_config(tmp_path / "c.toml")

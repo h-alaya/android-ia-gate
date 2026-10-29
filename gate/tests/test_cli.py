@@ -108,3 +108,14 @@ def test_cli_enroll_unknown_serial_exits_1(config_file, bench, monkeypatch, caps
     assert cli.main(["enroll", "NOPE", "VAL-042", "--config", config_file()]) == 1
     err = capsys.readouterr().err
     assert "NOPE" in err
+
+
+def test_cli_serve_http_wildcard_without_allowed_hosts_warns(config_file, monkeypatch, capsys):
+    monkeypatch.setenv("IA_GATE_TOKEN", "x")
+    monkeypatch.setattr(cli.uvicorn, "run", lambda app, **kwargs: None)
+    assert cli.main(["serve", "--transport", "http", "--config", config_file('host = "0.0.0.0"')]) == 0
+    assert "server.allowed_hosts" in capsys.readouterr().err
+
+    path = config_file('host = "0.0.0.0"\nallowed_hosts = ["192.168.1.10"]')
+    assert cli.main(["serve", "--transport", "http", "--config", path]) == 0
+    assert capsys.readouterr().err == ""

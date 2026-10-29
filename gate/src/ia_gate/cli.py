@@ -13,7 +13,7 @@ import uvicorn
 
 from ia_gate.adb import AdbClient, AdbError, Runner, subprocess_runner
 from ia_gate.audit import AuditLog
-from ia_gate.config import ConfigError, GateConfig, load_config, validate_for_http
+from ia_gate.config import WILDCARD_HOSTS, ConfigError, GateConfig, load_config, validate_for_http
 from ia_gate.context import GateContext
 from ia_gate.http import build_http_app
 from ia_gate.identity import normalize_device_id
@@ -75,6 +75,13 @@ def _parser() -> argparse.ArgumentParser:
 def _serve(cfg: GateConfig, transport: str) -> int:
     if transport == "http":
         validate_for_http(cfg)
+        if cfg.host in WILDCARD_HOSTS and not cfg.allowed_hosts:
+            print(
+                f"Attention : server.host = {cfg.host!r} sans server.allowed_hosts. La protection "
+                f"DNS-rebinding refusera les clients (HTTP 421). Ajoutez l'IP LAN et/ou le nom de ce PC "
+                f'dans server.allowed_hosts (ex. allowed_hosts = ["192.168.1.10", "gatepc.local"]).',
+                file=sys.stderr,
+            )
     server = build_server(_context(cfg))
     if transport == "http":
         uvicorn.run(build_http_app(server, cfg), host=cfg.host, port=cfg.port)
