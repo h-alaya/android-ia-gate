@@ -10,7 +10,7 @@ from dataclasses import replace
 import httpx2 as httpx
 import pytest
 
-from ia_gate.config import GateConfig
+from ia_gate.config import GateConfig, load_config
 from ia_gate.http import BearerTokenMiddleware, build_http_app
 
 TOKEN = "s3cret-token"
@@ -148,3 +148,26 @@ async def test_http_host_check_runs_after_auth(server, cfg, with_token):
     async with http_client(server, cfg, host="evil.example") as c:
         response = await c.post("/mcp", json=INITIALIZE, headers=MCP_HEADERS)
     assert response.status_code == 401
+
+
+@pytest.mark.parametrize("client_host", ["localhost", "127.0.0.1"])
+async def test_http_wildcard_bind_accepts_local_clients(server, cfg, with_token, client_host):
+    # 0.0.0.0 also listens on loopback: Claude Code on the gate PC keeps using localhost.
+    wildcard = replace(cfg, host="0.0.0.0", allowed_hosts=("192.168.1.10",))
+    async with http_client(server, wildcard, host=client_host) as c:
+        response = await c.post(
+            "/mcp", json=INITIALIZE, headers={**MCP_HEADERS, "Authorization": f"Bearer {TOKEN}"}
+        )
+    assert response.status_code == 200, response.text
+
+
+async def test_http_allowed_host_configured_in_upper_case(server, cfg, with_token, tmp_path):
+    # Clients lowercase the host name they send; the configured spelling must not matter.
+    (tmp_path / "c.toml").write_text('[server]\nhost = "0.0.0.0"\nallowed_hosts = ["GatePC.local"]\n')
+    loaded = load_config(tmp_path / "c.toml")
+    async with http_client(server, replace(cfg, host=loaded.host, allowed_hosts=loaded.allowed_hosts),
+                           host="gatepc.local") as c:
+        response = await c.post(
+            "/mcp", json=INITIALIZE, headers={**MCP_HEADERS, "Authorization": f"Bearer {TOKEN}"}
+        )
+    assert response.status_code == 200, response.text

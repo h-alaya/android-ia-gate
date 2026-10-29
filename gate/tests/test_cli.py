@@ -119,3 +119,13 @@ def test_cli_serve_http_wildcard_without_allowed_hosts_warns(config_file, monkey
     path = config_file('host = "0.0.0.0"\nallowed_hosts = ["192.168.1.10"]')
     assert cli.main(["serve", "--transport", "http", "--config", path]) == 0
     assert capsys.readouterr().err == ""
+
+
+def test_cli_serve_does_not_hide_unexpected_value_errors(config_file, monkeypatch):
+    # Only the gate's own errors are user errors; a bug elsewhere keeps its traceback.
+    def broken(app, **kwargs):
+        raise ValueError("bug in uvicorn")
+
+    monkeypatch.setattr(cli.uvicorn, "run", broken)
+    with pytest.raises(ValueError, match="bug in uvicorn"):
+        cli.main(["serve", "--transport", "http", "--config", config_file()])

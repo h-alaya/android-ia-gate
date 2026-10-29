@@ -130,9 +130,11 @@ traités en parallèle.
 - **Auth HTTP** : `Authorization: Bearer <token>` comparé en temps constant ; token lu
   depuis la variable d'environnement nommée dans la config (`IA_GATE_TOKEN` par défaut).
   Protection DNS-rebinding du SDK activée avec `allowed_hosts` = hôte(s) configuré(s)
-  (`server.host`, sauf `0.0.0.0`/`::`, plus `server.allowed_hosts`). Avec `host = "0.0.0.0"`,
-  renseigner `server.allowed_hosts` (IP LAN et/ou nom du PC), sinon les clients reçoivent un 421
-  expliquant quoi ajouter.
+  (`server.host`, sauf `0.0.0.0`/`::`, plus `localhost`/`127.0.0.1`/`::1` pour une écoute
+  loopback ou joker, plus `server.allowed_hosts`, normalisés : noms en minuscules, IP canoniques ;
+  jokers, ports et URL refusés). Avec `host = "0.0.0.0"`, renseigner `server.allowed_hosts`
+  (IP LAN et/ou nom du PC), sinon les clients du réseau reçoivent un 421 expliquant quoi ajouter ;
+  les clients du PC de la gate (`localhost`) restent acceptés.
 - **APK** : `apk_path` doit se résoudre (chemin réel, liens résolus) sous un des
   `policy.apk_dirs`, se terminer par `.apk` et exister.
 - **Shell** : la commande est découpée (`shlex`) ; refusée si elle contient un

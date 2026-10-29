@@ -22,7 +22,7 @@ from ia_gate.resolver import DeviceResolver, DeviceUnavailable
 from ia_gate.server import build_server
 
 # Failures whose message tells the user what to do: printed as is, exit code 1.
-_USER_ERRORS = (DeviceUnavailable, AdbError, RegistryError, ValueError)
+_USER_ERRORS = (DeviceUnavailable, AdbError, RegistryError)
 
 
 def _now() -> str:
@@ -78,7 +78,8 @@ def _serve(cfg: GateConfig, transport: str) -> int:
         if cfg.host in WILDCARD_HOSTS and not cfg.allowed_hosts:
             print(
                 f"Attention : server.host = {cfg.host!r} sans server.allowed_hosts. La protection "
-                f"DNS-rebinding refusera les clients (HTTP 421). Ajoutez l'IP LAN et/ou le nom de ce PC "
+                f"DNS-rebinding refusera les clients du réseau (HTTP 421) ; seuls ceux de ce PC "
+                f"(localhost) seront acceptés. Ajoutez l'IP LAN et/ou le nom de ce PC "
                 f'dans server.allowed_hosts (ex. allowed_hosts = ["192.168.1.10", "gatepc.local"]).',
                 file=sys.stderr,
             )
@@ -106,7 +107,11 @@ def _devices(cfg: GateConfig) -> int:
 
 
 def _enroll(cfg: GateConfig, adb_serial: str, device_id: str, label: str) -> int:
-    key = normalize_device_id(device_id)
+    try:
+        key = normalize_device_id(device_id)
+    except ValueError as exc:
+        print(f"Erreur : {exc}", file=sys.stderr)
+        return 1
     ctx = _context(cfg)
     record = asyncio.run(ctx.resolver.enroll(adb_serial, key, label, ctx.clock()))
     print(f"{record.device_id} enrôlé (serial adb {adb_serial}, modèle {record.fingerprint.model or '?'}).")

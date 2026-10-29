@@ -105,10 +105,11 @@ def _host_header(host: str, port: int) -> str:
 
 
 def _allowed_host_headers(cfg: GateConfig) -> list[str]:
-    # A wildcard bind is not a name clients can use: only `server.allowed_hosts` applies then.
+    # A wildcard bind is not a name clients can use, but it also listens on loopback: local clients
+    # keep using localhost (a DNS-rebinding attack sends the attacker's domain, never `localhost`).
     hosts = [] if cfg.host in WILDCARD_HOSTS else [cfg.host]
-    if cfg.host in LOOPBACK_HOSTS:
-        hosts += ["localhost", "127.0.0.1"]
+    if cfg.host in LOOPBACK_HOSTS | WILDCARD_HOSTS:
+        hosts += ["localhost", "127.0.0.1", "::1"]
     hosts += cfg.allowed_hosts
     return [_host_header(h, cfg.port) for h in dict.fromkeys(hosts)]
 

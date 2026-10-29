@@ -40,8 +40,15 @@ def test_allowed_hosts_loaded_from_server_section(tmp_path):
     assert load_config(tmp_path / "absent.toml").allowed_hosts == ()
 
 
-@pytest.mark.parametrize("entry", ["", "0.0.0.0", "gatepc.local:8765", "http://gatepc", "gate pc"])
+@pytest.mark.parametrize(
+    "entry", ["", "0.0.0.0", "gatepc.local:8765", "http://gatepc", "gate pc", "*", "*.local", "a,b", "-bad"]
+)
 def test_allowed_hosts_invalid_entry_refused(tmp_path, entry):
     (tmp_path / "c.toml").write_text(f'[server]\nallowed_hosts = ["{entry}"]\n')
     with pytest.raises(ConfigError, match="server.allowed_hosts"):
         load_config(tmp_path / "c.toml")
+
+
+def test_allowed_hosts_normalized(tmp_path):
+    (tmp_path / "c.toml").write_text('[server]\nallowed_hosts = ["GatePC.local", "FE80::0001"]\n')
+    assert load_config(tmp_path / "c.toml").allowed_hosts == ("gatepc.local", "fe80::1")

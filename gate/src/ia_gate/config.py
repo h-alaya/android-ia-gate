@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,26 +94,34 @@ def _str_list(
 def _allowed_hosts(data: dict[str, Any]) -> tuple[str, ...]:
     hosts = _str_list(data, "server", "allowed_hosts", ())
     assert hosts is not None
+    normalized: list[str] = []
     for host in hosts:
-        if not _is_valid_allowed_host(host):
+        canonical = _canonical_allowed_host(host)
+        if canonical is None:
             raise ConfigError(
                 f"Configuration invalide : server.allowed_hosts contient {host!r}. "
-                f"Indiquez uniquement des noms d'hôte ou adresses IP de la gate, sans port ni schéma "
-                f'(ex. ["192.168.1.10", "gatepc.local"]).'
+                f"Indiquez uniquement des noms d'hôte ou adresses IP de la gate, sans port, schéma ni "
+                f'joker (ex. ["192.168.1.10", "gatepc.local"]).'
             )
-    return hosts
+        normalized.append(canonical)
+    return tuple(dict.fromkeys(normalized))
 
 
-def _is_valid_allowed_host(host: str) -> bool:
-    if host in WILDCARD_HOSTS or any(c.isspace() or c in "/@[]" for c in host):
-        return False
-    if ":" in host:
-        # Only an IPv6 literal may contain a colon; a port is appended by the gate.
-        try:
-            ipaddress.IPv6Address(host)
-        except ValueError:
-            return False
-    return True
+_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_HOSTNAME_RE = re.compile(rf"{_LABEL}(?:\.{_LABEL})*\.?")
+
+
+def _canonical_allowed_host(host: str) -> str | None:
+    """The spelling clients send in the Host header (IPs canonical, names lower case), or None when
+    `host` is not a concrete IP address or host name (wildcards, ports, schemes, lists...)."""
+    if host in WILDCARD_HOSTS:
+        return None
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    name = host.lower()
+    return name if _HOSTNAME_RE.fullmatch(name) else None
 
 
 def load_config(path: Path | None = None) -> GateConfig:

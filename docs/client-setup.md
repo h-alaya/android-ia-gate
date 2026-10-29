@@ -74,8 +74,10 @@ allowed_hosts = ["192.168.1.10", "gatepc.local"]  # IP LAN et/ou nom de ce PC, s
 ```
 
 `allowed_hosts` alimente la protection DNS-rebinding : un client qui utilise un nom ou une IP
-absent de la liste reçoit un HTTP 421 indiquant quoi ajouter. Avec `host = "0.0.0.0"` et sans
-`allowed_hosts`, la gate affiche un avertissement au démarrage.
+absent de la liste reçoit un HTTP 421 indiquant quoi ajouter. Les clients installés sur le PC de
+la gate peuvent toujours utiliser `localhost` / `127.0.0.1`. La casse des noms n'importe pas ; les
+jokers (`*`) ne sont pas acceptés. Avec `host = "0.0.0.0"` et sans `allowed_hosts`, la gate affiche
+un avertissement au démarrage (seuls les clients locaux seront acceptés).
 
 ## 2. Lancer la gate comme service
 
