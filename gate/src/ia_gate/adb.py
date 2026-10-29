@@ -60,6 +60,16 @@ def _format_seconds(value: float) -> str:
     return f"{value:g}"
 
 
+async def _kill(proc: asyncio.subprocess.Process) -> None:
+    """Kill `proc` if still running and reap it."""
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    await proc.wait()
+
+
 async def subprocess_runner(args: Sequence[str], timeout: float) -> AdbResult:
     """Run `args` as a subprocess; kill it and raise `AdbTimeout` after `timeout` seconds."""
     args = list(args)
@@ -80,12 +90,16 @@ async def subprocess_runner(args: Sequence[str], timeout: float) -> AdbResult:
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
     except TimeoutError as exc:
-        proc.kill()
-        await proc.wait()
+        await _kill(proc)
         raise AdbTimeout(
             f"Commande adb expirée après {_format_seconds(timeout)} s : {shlex.join(args)}. "
             "Vérifiez que l'équipement répond (adb devices) ou augmentez `adb.timeout_s`."
         ) from exc
+    except BaseException:
+        # Cancellation (client cancel, server shutdown) or any other error: never leave
+        # an orphan adb process holding the device with nobody reading its pipes.
+        await _kill(proc)
+        raise
     return AdbResult(proc.returncode if proc.returncode is not None else -1, stdout, stderr)
 
 

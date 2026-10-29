@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -158,3 +159,23 @@ async def test_subprocess_runner_missing_binary():
 async def test_subprocess_runner_timeout():
     with pytest.raises(AdbTimeout, match="expirée"):
         await subprocess_runner(["sleep", "5"], 0.1)
+
+
+async def test_subprocess_runner_kills_process_on_cancel(monkeypatch):
+    procs: list[asyncio.subprocess.Process] = []
+    real_create = asyncio.create_subprocess_exec
+
+    async def capturing_create(*args, **kwargs):
+        proc = await real_create(*args, **kwargs)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capturing_create)
+    task = asyncio.create_task(subprocess_runner(["sleep", "5"], 10))
+    while not procs:
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert procs[0].returncode is not None
