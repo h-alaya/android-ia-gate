@@ -48,13 +48,20 @@ def device_info_answers(fake, serial):
 async def test_list_tools_names(client):
     tools = (await client.list_tools()).tools
     assert sorted(tool.name for tool in tools) == [
+        "clear_logs",
         "connect_wifi",
         "device_info",
         "enroll_device",
+        "get_logs",
         "install_apk",
         "launch_app",
         "list_devices",
+        "screenshot",
         "stop_app",
+        "ui_dump",
+        "ui_key",
+        "ui_tap",
+        "ui_text",
         "uninstall_app",
     ]
     assert all(tool.description for tool in tools)
