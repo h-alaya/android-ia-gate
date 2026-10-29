@@ -207,6 +207,7 @@ async def test_screenshot_rejects_non_png(client, fake, device):
 
 async def test_ui_dump_returns_xml(client, fake, device):
     xml = '<?xml version="1.0" encoding="UTF-8"?><hierarchy rotation="0"><node text="OK"/></hierarchy>'
+    fake.on(["shell", "rm", "-f", UI_PATH], serial=device)
     fake.on(["shell", "uiautomator", "dump"], stdout=f"UI hierchary dumped to: {UI_PATH}\n", serial=device)
     fake.on(["shell", "cat", UI_PATH], stdout=xml, serial=device)
 
@@ -214,18 +215,56 @@ async def test_ui_dump_returns_xml(client, fake, device):
 
     assert not result.is_error, text(result)
     assert data(result) == xml
+    rm_index = fake.calls.index(["adb", "-s", device, "shell", "rm", "-f", UI_PATH])
     dump_index = fake.calls.index(["adb", "-s", device, "shell", "uiautomator", "dump", UI_PATH])
     cat_index = fake.calls.index(["adb", "-s", device, "shell", "cat", UI_PATH])
-    assert dump_index < cat_index
+    assert rm_index < dump_index < cat_index
 
 
-async def test_ui_dump_error_is_reported(client, fake, device):
-    fake.on(["shell", "uiautomator", "dump"], stdout="ERROR: could not get idle state.\n", serial=device)
+async def test_ui_dump_error_on_stderr_is_reported(client, fake, device):
+    # Android 7+ (adb shell v2) keeps stderr apart; uiautomator writes its errors there, exit 0.
+    fake.on(["shell", "rm", "-f", UI_PATH], serial=device)
+    fake.on(["shell", "uiautomator", "dump"], stderr="ERROR: could not get idle state.\n", serial=device)
 
     result = await client.call_tool("ui_dump", {"device_id": "VAL-042"})
 
     assert result.is_error
     assert "could not get idle state" in text(result)
+    assert "VAL-042" in text(result)
+    assert ["adb", "-s", device, "shell", "cat", UI_PATH] not in fake.calls
+
+
+async def test_ui_dump_failure_never_returns_stale_xml(client, fake, device):
+    stale = '<?xml version="1.0"?><hierarchy><node text="ECRAN A"/></hierarchy>'
+    fake.on(["shell", "rm", "-f", UI_PATH], serial=device)
+    fake.on(
+        ["shell", "uiautomator", "dump"],
+        stderr="ERROR: null root node returned by UiTestAutomationBridge.\n",
+        serial=device,
+    )
+    fake.on(["shell", "cat", UI_PATH], stdout=stale, serial=device)
+
+    result = await client.call_tool("ui_dump", {"device_id": "VAL-042"})
+
+    assert result.is_error
+    assert "ECRAN A" not in text(result)
+    assert "null root node" in text(result)
+    rm_index = fake.calls.index(["adb", "-s", device, "shell", "rm", "-f", UI_PATH])
+    dump_index = fake.calls.index(["adb", "-s", device, "shell", "uiautomator", "dump", UI_PATH])
+    assert rm_index < dump_index
+    assert ["adb", "-s", device, "shell", "cat", UI_PATH] not in fake.calls
+
+
+async def test_ui_dump_without_confirmation_is_an_error(client, fake, device):
+    # No "dumped to" line and no explicit ERROR: the dump cannot be trusted.
+    fake.on(["shell", "rm", "-f", UI_PATH], serial=device)
+    fake.on(["shell", "uiautomator", "dump"], stdout="", serial=device)
+    fake.on(["shell", "cat", UI_PATH], stdout="<hierarchy/>", serial=device)
+
+    result = await client.call_tool("ui_dump", {"device_id": "VAL-042"})
+
+    assert result.is_error
+    assert "VAL-042" in text(result)
     assert ["adb", "-s", device, "shell", "cat", UI_PATH] not in fake.calls
 
 

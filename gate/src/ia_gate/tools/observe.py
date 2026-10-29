@@ -142,11 +142,17 @@ def register(server: MCPServer, ctx: GateContext) -> None:
         key = normalize_device_id(device_id)
 
         async def op(target: Target) -> str:
-            output = (await ctx.adb.shell(target, ["uiautomator", "dump", UI_DUMP_PATH])).text
-            if "ERROR" in output:
+            # Remove any previous dump so a failed dump can never serve a stale screen.
+            await ctx.adb.shell(target, ["rm", "-f", UI_DUMP_PATH])
+            result = await ctx.adb.shell(target, ["uiautomator", "dump", UI_DUMP_PATH])
+            # uiautomator exits 0 on failure and writes "ERROR: …" to stderr (kept apart from
+            # stdout by adb shell v2, Android 7+); only a "dumped to" line confirms success.
+            output = "\n".join(part for part in (result.err_text.strip(), result.text.strip()) if part)
+            if "ERROR" in output or "dumped to" not in result.text:
                 raise ToolError(
-                    f"uiautomator dump a échoué sur {key} : {output.strip()}. Attendez que l'écran "
-                    "soit stable (fin des animations, écran allumé) puis réessayez."
+                    f"uiautomator dump a échoué sur {key} : {output or 'aucune sortie'}. Attendez "
+                    "que l'écran soit stable (fin des animations, écran allumé et déverrouillé) "
+                    "puis réessayez."
                 )
             return (await ctx.adb.shell(target, ["cat", UI_DUMP_PATH])).text
 
