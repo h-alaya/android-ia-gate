@@ -9,6 +9,7 @@ connected devices is addressed by its transport id (`adb -t N`).
 from __future__ import annotations
 
 import asyncio
+import re
 from collections import Counter
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
@@ -34,12 +35,20 @@ _TRANSPORT_PREFIX = "transport_id:"
 IDENTIFY_TIMEOUT_S = 8.0
 
 # Read on every scan, in one adb call, from every online device: the fields that identify it.
-# Each value is tagged so a missing or failing command cannot shift the others.
+# Each value is tagged so a missing or failing command cannot shift the others. A failing
+# `settings` (early boot) fails the whole probe: an unread android_id must never pass for "none".
+# boot_id is random per boot: equal values prove two adb transports reach the same device.
 IDENTITY_PROBE = (
+    "a=$(settings get secure android_id) || exit 1; "
     'echo "serialno=$(getprop ro.serialno)"; '
-    'echo "android_id=$(settings get secure android_id)"; '
+    'echo "android_id=$a"; '
+    'echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; '
     f'echo "marker=$(cat {MARKER_PATH} 2>/dev/null)"'
 )
+_PROBE_TAGS = ("serialno", "android_id", "boot_id", "marker")
+
+# adb serial of a network transport: `ip:port`, or an mDNS service name (`adb-…._adb-tls-connect._tcp`).
+_NETWORK_SERIAL = re.compile(r"(:\d+|\._adb-tls-[a-z]+\._tcp\.?)$")
 
 # One adb connection: the serial alone is not enough (shared serials). It does not prove the
 # device behind it is unchanged (transport ids restart with the adb server, Wi-Fi addresses are
@@ -70,10 +79,16 @@ class _Seen:
     adb_state: str
     fingerprint: Fingerprint | None
     device_id: str | None
+    marker: str | None = None  # read fresh during this scan, else None
+    boot_id: str = ""  # read fresh during this scan, else ""
 
     @property
     def address(self) -> str:
         return str(self.target)
+
+    @property
+    def is_network(self) -> bool:
+        return _NETWORK_SERIAL.search(self.device.serial) is not None
 
 
 def _state(adb_state: str) -> State:
@@ -88,13 +103,17 @@ def _conn_key(device: AdbDevice) -> _ConnKey:
     return (device.serial, device.transport_id)
 
 
-def _parse_probe(text: str, target: Target) -> tuple[str, str, str | None]:
-    """(serialno, android_id, marker) from the output of `IDENTITY_PROBE`; `AdbError` if garbled."""
+def _parse_probe(text: str, target: Target) -> tuple[str, str, str, str | None]:
+    """(serialno, android_id, boot_id, marker) from the output of `IDENTITY_PROBE`.
+
+    `AdbError` if garbled or if android_id is empty: a device without one reports the literal
+    `null`, so an empty value means the read failed (fail closed, the device counts as offline).
+    """
     lines = text.splitlines()
     values: dict[str, str] = {}
     for index, line in enumerate(lines):
         tag, sep, value = line.partition("=")
-        if not sep or tag in values or tag not in ("serialno", "android_id", "marker"):
+        if not sep or tag in values or tag not in _PROBE_TAGS:
             continue
         if tag == "marker":
             # Last field: keep the whole file content, a multi-line marker is malformed.
@@ -102,7 +121,7 @@ def _parse_probe(text: str, target: Target) -> tuple[str, str, str | None]:
         values[tag] = value.strip()
         if tag == "marker":
             break
-    if len(values) != 3:
+    if len(values) != len(_PROBE_TAGS) or not values["android_id"]:
         output = text.strip() or "aucune sortie"
         raise AdbError(
             f"Réponse inattendue de {target} à la lecture de son identité : {output}. "
@@ -113,7 +132,7 @@ def _parse_probe(text: str, target: Target) -> tuple[str, str, str | None]:
         marker: str | None = normalize_device_id(values["marker"])
     except ValueError:
         marker = None
-    return values["serialno"], android_id, marker
+    return values["serialno"], android_id, values["boot_id"], marker
 
 
 def _capitalize(text: str) -> str:
@@ -138,12 +157,52 @@ def _describe(seen: Sequence[_Seen]) -> str:
     return ", ".join(f"{s.address} ({s.adb_state})" for s in seen) or "aucun"
 
 
+def _same_transports(hits: Sequence[_Seen]) -> tuple[bool, bool]:
+    """(may be one device on several transports, proven to be).
+
+    Possible when every hit was identified fresh with the same serialno, android_id and marker
+    and no two of them report different boot ids; proven when, in addition, the boot id and the
+    android_id are known (a cloned image can carry the marker, never the boot id).
+    """
+    identities = {
+        (h.fingerprint.serialno, h.fingerprint.android_id, h.marker) if h.fingerprint else None
+        for h in hits
+    }
+    if len(identities) != 1 or None in identities or any(h.marker is None for h in hits):
+        return False, False
+    boot_ids = {h.boot_id for h in hits}
+    if len(boot_ids - {""}) > 1:
+        return False, False
+    proven = "" not in boot_ids and all(h.fingerprint and h.fingerprint.android_id for h in hits)
+    return True, proven
+
+
+def _several_hits_message(key: str, hits: Sequence[_Seen], maybe_same: bool) -> str:
+    message = f"Plusieurs appareils connectés correspondent à {key} : {_describe(hits)}. "
+    if maybe_same:
+        network = [h.address for h in hits if h.is_network]
+        how = (
+            "lancez " + " ou ".join(f"`adb disconnect {address}`" for address in network)
+            if network
+            else "débranchez l'une des connexions"
+        )
+        return message + (
+            f"Il s'agit probablement de {key} connecté plusieurs fois (USB et Wi-Fi) : débranchez "
+            f"le câble USB ou {how}, puis réessayez."
+        )
+    return message + (
+        f"Impossible de choisir sans risque d'erreur : débranchez ceux qui ne sont pas {key}, ou "
+        "effacez leur marqueur et enrôlez-les sous un autre ID."
+    )
+
+
 class DeviceResolver:
     def __init__(self, adb: AdbClient, registry: DeviceRegistry) -> None:
         self._adb = adb
         self._registry = registry
         self._fingerprints: dict[_ConnKey, Fingerprint] = {}
         self._markers: dict[_ConnKey, str | None] = {}
+        self._boot_ids: dict[_ConnKey, str] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
     # -- public API ----------------------------------------------------------------------------
@@ -163,7 +222,7 @@ class DeviceResolver:
             if not hits and record is not None:
                 model = record.fingerprint.model or None
                 statuses.append(DeviceStatus(device_id, None, "disconnected", label, model))
-            # Several hits would be a gate-level conflict: show them all, `resolve` refuses them.
+            # Several hits (one device over USB and Wi-Fi, or a conflict `resolve` refuses): show all.
             for entry in hits:
                 statuses.append(
                     DeviceStatus(device_id, entry.address, entry.state, label, self._model(entry, record))
@@ -199,11 +258,11 @@ class DeviceResolver:
                 )
             raise DeviceUnavailable(message)
         if len(hits) > 1:
-            raise DeviceUnavailable(
-                f"Plusieurs appareils connectés correspondent à {key} : {_describe(hits)}. Impossible de "
-                f"choisir sans risque d'erreur : débranchez ceux qui ne sont pas {key}, ou effacez leur "
-                "marqueur et enrôlez-les sous un autre ID."
-            )
+            maybe_same, proven = _same_transports(hits)
+            if not proven:
+                raise DeviceUnavailable(_several_hits_message(key, hits, maybe_same))
+            # One device reached over USB and Wi-Fi (connect_wifi flow): prefer the cable.
+            hits = sorted(hits, key=lambda h: (h.is_network, h.address))
         hit = hits[0]
         if hit.state != "online":
             raise DeviceUnavailable(_not_ready_message(key, hit.state, hit.adb_state))
@@ -304,8 +363,9 @@ class DeviceResolver:
         """
         conn = _conn_key(device)
         result = await self._adb.shell(target, ["sh", "-c", IDENTITY_PROBE])
-        serialno, android_id, marker = _parse_probe(result.text, target)
+        serialno, android_id, boot_id, marker = _parse_probe(result.text, target)
         self._markers[conn] = marker
+        self._boot_ids[conn] = boot_id
         cached = self._fingerprints.get(conn)
         if cached is not None and (cached.serialno, cached.android_id) == (serialno, android_id):
             return cached
@@ -319,7 +379,7 @@ class DeviceResolver:
     async def _scan(self) -> tuple[list[_Seen], dict[str, DeviceRecord]]:
         devices = await self._adb.devices()
         connected = {_conn_key(d) for d in devices}
-        for cache in (self._fingerprints, self._markers):
+        for cache in (self._fingerprints, self._markers, self._boot_ids):
             for conn in [c for c in cache if c not in connected]:
                 del cache[conn]
         duplicated = duplicate_serials(devices)
@@ -336,16 +396,21 @@ class DeviceResolver:
         for index, device in enumerate(devices):
             state = _state(device.state)
             conn = _conn_key(device)
+            marker, boot_id = None, ""
             if index in fingerprints:
                 fingerprint = fingerprints[index]
                 if fingerprint is None:
                     state = "offline"  # listed as online but does not answer shell commands
+                else:
+                    marker, boot_id = self._markers.get(conn), self._boot_ids.get(conn, "")
             else:
                 fingerprint = self._fingerprints.get(conn)
             device_id = None
             if fingerprint is not None:
                 device_id = self._registry.match(fingerprint, self._markers.get(conn), ambiguous)
-            seen.append(_Seen(device, targets[index], state, device.state, fingerprint, device_id))
+            seen.append(
+                _Seen(device, targets[index], state, device.state, fingerprint, device_id, marker, boot_id)
+            )
 
         # A device that is not online cannot be fingerprinted: fall back to the last adb serial
         # an enrolled device was reached through, when unambiguous.

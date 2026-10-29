@@ -43,6 +43,7 @@ class Bench:
         self.registry = DeviceRegistry(tmp_path / "devices.json")
         self.resolver = DeviceResolver(self.adb, self.registry)
         self._fingerprints = {}
+        self._boot_ids = {}
 
     async def _run(self, args, timeout):
         result = await self.fake(args, timeout)
@@ -50,7 +51,7 @@ class Bench:
             target = TransportId(int(args[2])) if args[1] == "-t" else args[2]
             marker = args[6].split()[1]
             self.fake.on(CAT, stdout=marker + "\n", serial=target)
-            self._probe(target, self._fingerprints[target], marker)
+            self._probe(target, self._fingerprints[target], marker, self._boot_ids[target])
         return result
 
     def devices(self, *lines):
@@ -58,12 +59,19 @@ class Bench:
             ["devices", "-l"], stdout="List of devices attached\n" + "".join(f"{x}\n" for x in lines)
         )
 
-    def _probe(self, target, fp, marker):
-        stdout = f"serialno={fp.serialno}\nandroid_id={fp.android_id or 'null'}\nmarker={marker or ''}\n"
+    def _probe(self, target, fp, marker, boot_id):
+        stdout = (
+            f"serialno={fp.serialno}\nandroid_id={fp.android_id or 'null'}\n"
+            f"boot_id={boot_id}\nmarker={marker or ''}\n"
+        )
         self.fake.on(PROBE, stdout=stdout, serial=target)
 
-    def device(self, target, fp, marker=None):
+    def device(self, target, fp, marker=None, boot_id=None):
+        """Simulate a device; `boot_id` defaults to one unique to `target` (a distinct device)."""
+        if boot_id is None:
+            boot_id = f"boot-{target}"
         self._fingerprints[target] = fp
+        self._boot_ids[target] = boot_id
         self.fake.on(["shell", "getprop", "ro.serialno"], stdout=fp.serialno + "\n", serial=target)
         self.fake.on(
             ["shell", "settings", "get", "secure", "android_id"],
@@ -77,7 +85,7 @@ class Bench:
             self.fake.on(CAT, returncode=1, stderr="No such file or directory", serial=target)
         else:
             self.fake.on(CAT, stdout=marker + "\n", serial=target)
-        self._probe(target, fp, marker)
+        self._probe(target, fp, marker, boot_id)
 
     def shell_calls(self):
         return [call for call in self.fake.calls if "shell" in call]
@@ -201,6 +209,72 @@ async def test_unparseable_probe_output_counts_as_offline(bench):
     bench.device("R58A", FP_A)
     bench.fake.on(PROBE, stdout="sh: settings: not found\n", serial="R58A")
     assert await bench.resolver.snapshot() == [DeviceStatus(None, "R58A", "offline", "", "SM X")]
+
+
+async def test_probe_failing_settings_command_exits_non_zero():
+    # `settings` failing (early boot: "cmd: Can't find service: settings") must fail the probe.
+    assert "|| exit 1" in IDENTITY_PROBE
+
+
+async def test_empty_android_id_in_probe_fails_closed(bench):
+    # VAL-1 is not connected. A batch sibling sharing its valid ro.serialno is, but its
+    # `settings get secure android_id` failed: an empty value must not read as "no android_id",
+    # otherwise the serialno alone would hand VAL-1's ID to the sibling.
+    bench.registry.enroll("VAL-1", FP_A, "", NOW)
+    sibling = Fingerprint(FP_A.serialno, "5151aaaa", "samsung", "SM-A")
+    bench.devices(usb("R58SIB", 1))
+    bench.device("R58SIB", sibling)
+    bench.fake.on(
+        PROBE, stdout=f"serialno={FP_A.serialno}\nandroid_id=\nboot_id=b1\nmarker=\n", serial="R58SIB"
+    )
+    with pytest.raises(DeviceUnavailable, match="VAL-1 n'est pas connecté"):
+        await bench.resolver.resolve("VAL-1")
+    snapshot = await bench.resolver.snapshot()
+    assert DeviceStatus(None, "R58SIB", "offline", "", "SM X") in snapshot
+    assert all(status.device_id != "VAL-1" or status.adb_serial is None for status in snapshot)
+
+
+async def test_same_device_over_usb_and_wifi_resolves_to_usb(bench):
+    # Normal connect_wifi flow: `adb tcpip` needs the cable, so the device is listed twice.
+    bench.registry.enroll("VAL-042", FP_A, "", NOW)
+    bench.devices(usb("R58M12AAAAA", 1), usb("192.168.1.50:5555", 2))
+    bench.device("R58M12AAAAA", FP_A, marker="VAL-042", boot_id="b-042")
+    bench.device("192.168.1.50:5555", FP_A, marker="VAL-042", boot_id="b-042")
+    assert await bench.resolver.resolve("VAL-042") == "R58M12AAAAA"
+    assert bench.registry.get("VAL-042").last_adb_serial == "R58M12AAAAA"
+
+    bench.devices(usb("192.168.1.50:5555", 2), usb("R58M12AAAAA", 1))
+    assert await bench.resolver.resolve("VAL-042") == "R58M12AAAAA"
+
+    # Cable unplugged: only the Wi-Fi transport is left.
+    bench.devices(usb("192.168.1.50:5555", 2))
+    assert await bench.resolver.resolve("VAL-042") == "192.168.1.50:5555"
+
+
+async def test_same_identity_unproven_suggests_disconnecting_a_transport(bench):
+    # Same serialno, android_id and marker but boot_id unreadable: maybe one device twice,
+    # maybe a clone. Refuse, and do not only advise wiping the marker.
+    bench.registry.enroll("VAL-042", FP_A, "", NOW)
+    bench.devices(usb("R58M12AAAAA", 1), usb("192.168.1.50:5555", 2))
+    bench.device("R58M12AAAAA", FP_A, marker="VAL-042", boot_id="")
+    bench.device("192.168.1.50:5555", FP_A, marker="VAL-042", boot_id="")
+    with pytest.raises(DeviceUnavailable, match="Plusieurs appareils") as exc:
+        await bench.resolver.resolve("VAL-042")
+    message = str(exc.value)
+    assert "USB et Wi-Fi" in message
+    assert "adb disconnect 192.168.1.50:5555" in message
+
+
+async def test_clones_with_same_identity_but_different_boot_ids_are_refused(bench):
+    # Cloned image (marker included): same serialno, android_id and marker, but two boots.
+    bench.registry.enroll("VAL-042", FP_A, "", NOW)
+    bench.devices(usb("10.0.0.1:5555", 1), usb("10.0.0.2:5555", 2))
+    bench.device("10.0.0.1:5555", FP_A, marker="VAL-042")
+    bench.device("10.0.0.2:5555", FP_A, marker="VAL-042")
+    with pytest.raises(DeviceUnavailable, match="Plusieurs appareils") as exc:
+        await bench.resolver.resolve("VAL-042")
+    assert "USB et Wi-Fi" not in str(exc.value)
+    assert "effacez leur marqueur" in str(exc.value)
 
 
 async def test_resolve_follows_device_from_usb_to_wifi(bench):
