@@ -124,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         print(secrets.token_urlsafe(32))
         return 0
     try:
-        cfg = load_config(args.config)
+        cfg = load_config(args.config, explicit=args.config is not None)
         if args.command == "serve":
             return _serve(cfg, args.transport)
         if args.command == "devices":

@@ -129,3 +129,8 @@ def test_cli_serve_does_not_hide_unexpected_value_errors(config_file, monkeypatc
     monkeypatch.setattr(cli.uvicorn, "run", broken)
     with pytest.raises(ValueError, match="bug in uvicorn"):
         cli.main(["serve", "--transport", "http", "--config", config_file()])
+
+
+def test_cli_mistyped_config_path_exits_2(tmp_path, capsys):
+    assert cli.main(["devices", "--config", str(tmp_path / "typo.tml")]) == 2
+    assert "introuvable" in capsys.readouterr().err

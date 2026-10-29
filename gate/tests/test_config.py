@@ -52,3 +52,30 @@ def test_allowed_hosts_invalid_entry_refused(tmp_path, entry):
 def test_allowed_hosts_normalized(tmp_path):
     (tmp_path / "c.toml").write_text('[server]\nallowed_hosts = ["GatePC.local", "FE80::0001"]\n')
     assert load_config(tmp_path / "c.toml").allowed_hosts == ("gatepc.local", "fe80::1")
+
+
+def test_utf8_bom_is_accepted(tmp_path):
+    (tmp_path / "c.toml").write_bytes(b"\xef\xbb\xbf[server]\nport = 9000\n")  # Windows Notepad
+    assert load_config(tmp_path / "c.toml").port == 9000
+
+
+def test_non_utf8_file_is_config_error(tmp_path):
+    (tmp_path / "c.toml").write_bytes('[policy]\napk_dirs = ["C:/Users/hélène"]\n'.encode("cp1252"))
+    with pytest.raises(ConfigError, match="UTF-8"):
+        load_config(tmp_path / "c.toml")
+
+
+def test_explicit_missing_path_is_config_error(tmp_path):
+    with pytest.raises(ConfigError, match="introuvable"):
+        load_config(tmp_path / "typo.tml", explicit=True)
+
+
+@pytest.mark.parametrize(
+    "toml",
+    ["[server]\nport = 0\n", "[server]\nport = 70000\n", "[adb]\ntimeout_s = 0\n",
+     "[adb]\ntimeout_s = -1\n", "[adb]\ntimeout_s = nan\n", "[policy]\nmax_log_bytes = 0\n"],
+)
+def test_out_of_range_numbers_refused(tmp_path, toml):
+    (tmp_path / "c.toml").write_text(toml)
+    with pytest.raises(ConfigError):
+        load_config(tmp_path / "c.toml")

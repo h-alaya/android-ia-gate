@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 import re
 import tomllib
@@ -124,13 +125,25 @@ def _canonical_allowed_host(host: str) -> str | None:
     return name if _HOSTNAME_RE.fullmatch(name) else None
 
 
-def load_config(path: Path | None = None) -> GateConfig:
-    """Load the gate configuration; a missing file yields the defaults. Unknown keys are ignored."""
+def load_config(path: Path | None = None, *, explicit: bool = False) -> GateConfig:
+    """Load the gate configuration; a missing file yields the defaults, unless the path was given
+    explicitly by the user (`explicit`): a typo must not silently widen the policy. Unknown keys
+    are ignored."""
     cfg_path = (path if path is not None else DEFAULT_CONFIG_PATH).expanduser()
     if not cfg_path.exists():
+        if explicit:
+            raise ConfigError(
+                f"Fichier de configuration {cfg_path} introuvable : vérifiez le chemin de --config."
+            )
         return GateConfig()
     try:
-        data = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
+        # utf-8-sig: Windows Notepad may save the file with a BOM.
+        data = tomllib.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    except UnicodeDecodeError as exc:
+        raise ConfigError(
+            f"Fichier de configuration {cfg_path} illisible : il n'est pas encodé en UTF-8. "
+            f"Réenregistrez-le en UTF-8."
+        ) from exc
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(
             f"Fichier de configuration {cfg_path} illisible (TOML invalide : {exc}). "
@@ -143,7 +156,7 @@ def load_config(path: Path | None = None) -> GateConfig:
 
     d = GateConfig()
     apk_dirs = _str_list(data, "policy", "apk_dirs", None)
-    return GateConfig(
+    cfg = GateConfig(
         host=_get(data, "server", "host", str, d.host),
         port=_get(data, "server", "port", int, d.port),
         token_env=_get(data, "server", "token_env", str, d.token_env),
@@ -156,6 +169,25 @@ def load_config(path: Path | None = None) -> GateConfig:
         max_log_bytes=_get(data, "policy", "max_log_bytes", int, d.max_log_bytes),
         allowed_hosts=_allowed_hosts(data),
     )
+    _check_ranges(cfg)
+    return cfg
+
+
+def _check_ranges(cfg: GateConfig) -> None:
+    if not 1 <= cfg.port <= 65535:
+        raise ConfigError(
+            f"Configuration invalide : server.port = {cfg.port}. Indiquez un port entre 1 et 65535."
+        )
+    if not (math.isfinite(cfg.adb_timeout_s) and cfg.adb_timeout_s > 0):
+        raise ConfigError(
+            f"Configuration invalide : adb.timeout_s = {cfg.adb_timeout_s}. Indiquez une durée en "
+            f"secondes supérieure à 0 (défaut : 120)."
+        )
+    if cfg.max_log_bytes <= 0:
+        raise ConfigError(
+            f"Configuration invalide : policy.max_log_bytes = {cfg.max_log_bytes}. Indiquez une taille "
+            f"en octets supérieure à 0 (défaut : 200000)."
+        )
 
 
 def validate_for_http(cfg: GateConfig) -> None:
