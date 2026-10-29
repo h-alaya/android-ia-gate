@@ -51,7 +51,11 @@ async def test_list_tools_names(client):
         "connect_wifi",
         "device_info",
         "enroll_device",
+        "install_apk",
+        "launch_app",
         "list_devices",
+        "stop_app",
+        "uninstall_app",
     ]
     assert all(tool.description for tool in tools)
 
