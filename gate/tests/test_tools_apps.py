@@ -294,12 +294,43 @@ async def test_launch_am_start_error_is_tool_error(client, fake, device):
 
 
 async def test_launch_monkey_without_launcher_activity(client, fake, device):
+    # adb shell protocol v2 (Android 7+): monkey writes to stderr and exits with -4 (252).
+    fake.on(
+        ["shell", "monkey"],
+        returncode=252,
+        stderr="** No activities found to run, monkey aborted.\n",
+        serial=device,
+    )
+
+    result = await client.call_tool("launch_app", {"device_id": "VAL-042", "package": PKG})
+
+    assert result.is_error
+    assert "Aucune activité de lancement" in text(result)
+    assert "install_apk" in text(result)
+    assert "`activity`" in text(result)
+    assert not any("pidof" in call for call in fake.calls)
+
+
+async def test_launch_monkey_without_launcher_activity_old_device(client, fake, device):
+    # Pre-v2 shell protocol: stderr is merged into stdout and the exit code is always 0.
     fake.on(["shell", "monkey"], stdout="** No activities found to run, monkey aborted.\n", serial=device)
 
     result = await client.call_tool("launch_app", {"device_id": "VAL-042", "package": PKG})
 
     assert result.is_error
-    assert "activity" in text(result)
+    assert "Aucune activité de lancement" in text(result)
+    assert "`activity`" in text(result)
+    assert not any("pidof" in call for call in fake.calls)
+
+
+async def test_launch_monkey_other_failure_is_reported(client, fake, device):
+    fake.on(["shell", "monkey"], returncode=1, stderr="monkey: permission denied\n", serial=device)
+
+    result = await client.call_tool("launch_app", {"device_id": "VAL-042", "package": PKG})
+
+    assert result.is_error
+    assert "permission denied" in text(result)
+    assert "Aucune activité de lancement" not in text(result)
     assert not any("pidof" in call for call in fake.calls)
 
 

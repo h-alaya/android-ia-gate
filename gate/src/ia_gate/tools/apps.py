@@ -145,12 +145,22 @@ def register(server: MCPServer, ctx: GateContext) -> None:
         async def op(target: Target) -> dict[str, Any]:
             if activity is None:
                 args = ["monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"]
-                output = (await ctx.adb.shell(target, args)).text
+                no_launcher = ToolError(
+                    f"Aucune activité de lancement pour {package} sur {key} : vérifiez que l'app "
+                    "est installée (install_apk) ou précisez `activity`."
+                )
+                try:
+                    output = (await ctx.adb.shell(target, args)).text
+                except (AdbTimeout, AdbNotFound):
+                    raise
+                except AdbError as exc:
+                    # Shell protocol v2 (Android 7+): monkey reports on stderr and exits with -4.
+                    if "No activities found" in str(exc):
+                        raise no_launcher from exc
+                    raise
+                # Pre-v2 shell protocol: stderr is merged into stdout and the exit code is 0.
                 if "No activities found" in output:
-                    raise ToolError(
-                        f"Aucune activité de lancement pour {package} sur {key} : vérifiez que l'app "
-                        "est installée (install_apk) ou précisez `activity`."
-                    )
+                    raise no_launcher
             else:
                 args = ["am", "start", "-W", "-n", f"{package}/{activity}"]
                 output = (await ctx.adb.shell(target, args)).text
