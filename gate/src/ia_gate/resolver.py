@@ -15,7 +15,14 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ia_gate.adb import AdbClient, AdbDevice, AdbError, AdbNotFound, Target, duplicate_serials
-from ia_gate.identity import Fingerprint, normalize_device_id, read_fingerprint, read_marker, write_marker
+from ia_gate.identity import (
+    MARKER_PATH,
+    Fingerprint,
+    normalize_device_id,
+    read_fingerprint,
+    read_marker,
+    write_marker,
+)
 from ia_gate.registry import DeviceRecord, DeviceRegistry, RegistryError
 
 State = Literal["online", "offline", "unauthorized", "disconnected"]
@@ -26,8 +33,17 @@ _TRANSPORT_PREFIX = "transport_id:"
 # `device` but that no longer answers (typically Wi-Fi) must not stall calls on the others.
 IDENTIFY_TIMEOUT_S = 8.0
 
-# One adb connection: the serial alone is not enough (shared serials), and a reconnect gets a
-# new transport id, so a device swapped behind the same serial is never served a stale cache.
+# Read on every scan, in one adb call, from every online device: the fields that identify it.
+# Each value is tagged so a missing or failing command cannot shift the others.
+IDENTITY_PROBE = (
+    'echo "serialno=$(getprop ro.serialno)"; '
+    'echo "android_id=$(settings get secure android_id)"; '
+    f'echo "marker=$(cat {MARKER_PATH} 2>/dev/null)"'
+)
+
+# One adb connection: the serial alone is not enough (shared serials). It does not prove the
+# device behind it is unchanged (transport ids restart with the adb server, Wi-Fi addresses are
+# reassigned), so cached data is always checked against a fresh identity read.
 _ConnKey = tuple[str, int | None]
 
 
@@ -70,6 +86,34 @@ def _state(adb_state: str) -> State:
 
 def _conn_key(device: AdbDevice) -> _ConnKey:
     return (device.serial, device.transport_id)
+
+
+def _parse_probe(text: str, target: Target) -> tuple[str, str, str | None]:
+    """(serialno, android_id, marker) from the output of `IDENTITY_PROBE`; `AdbError` if garbled."""
+    lines = text.splitlines()
+    values: dict[str, str] = {}
+    for index, line in enumerate(lines):
+        tag, sep, value = line.partition("=")
+        if not sep or tag in values or tag not in ("serialno", "android_id", "marker"):
+            continue
+        if tag == "marker":
+            # Last field: keep the whole file content, a multi-line marker is malformed.
+            value = "\n".join([value, *lines[index + 1 :]])
+        values[tag] = value.strip()
+        if tag == "marker":
+            break
+    if len(values) != 3:
+        output = text.strip() or "aucune sortie"
+        raise AdbError(
+            f"Réponse inattendue de {target} à la lecture de son identité : {output}. "
+            "Vérifiez que `adb shell getprop ro.serialno` répond normalement, sinon rebranchez l'appareil."
+        )
+    android_id = "" if values["android_id"] == "null" else values["android_id"]
+    try:
+        marker: str | None = normalize_device_id(values["marker"])
+    except ValueError:
+        marker = None
+    return values["serialno"], android_id, marker
 
 
 def _capitalize(text: str) -> str:
@@ -238,7 +282,7 @@ class DeviceResolver:
         return matches[0]
 
     async def _identify(self, device: AdbDevice, target: Target) -> Fingerprint | None:
-        """Fingerprint (cached per connection) and fresh marker of an online device; None if it fails.
+        """Fresh fingerprint (model cached per connection) and marker of an online device; None if it fails.
 
         Bounded by `IDENTIFY_TIMEOUT_S`: a device that does not answer in time counts as offline
         (cancelling the read kills the pending adb subprocess).
@@ -251,12 +295,25 @@ class DeviceResolver:
             return None
 
     async def _read_identity(self, device: AdbDevice, target: Target) -> Fingerprint:
+        """Identity read fresh on every scan; only manufacturer and model are cached.
+
+        The connection key (adb serial, transport id) does not prove it is still the same
+        device: transport ids restart at 1 with the adb server and a Wi-Fi `ip:port` can be
+        handed to another device. So serialno, android_id and marker are always re-read, and the
+        cached entry is dropped as soon as serialno or android_id differ from it.
+        """
         conn = _conn_key(device)
-        fingerprint = self._fingerprints.get(conn)
-        if fingerprint is None:
-            fingerprint = await read_fingerprint(self._adb, target)
-            self._fingerprints[conn] = fingerprint
-        self._markers[conn] = await read_marker(self._adb, target)
+        result = await self._adb.shell(target, ["sh", "-c", IDENTITY_PROBE])
+        serialno, android_id, marker = _parse_probe(result.text, target)
+        self._markers[conn] = marker
+        cached = self._fingerprints.get(conn)
+        if cached is not None and (cached.serialno, cached.android_id) == (serialno, android_id):
+            return cached
+        self._fingerprints.pop(conn, None)
+        manufacturer = await self._adb.getprop(target, "ro.product.manufacturer")
+        model = await self._adb.getprop(target, "ro.product.model")
+        fingerprint = Fingerprint(serialno, android_id, manufacturer, model)
+        self._fingerprints[conn] = fingerprint
         return fingerprint
 
     async def _scan(self) -> tuple[list[_Seen], dict[str, DeviceRecord]]:

@@ -1,4 +1,5 @@
 import asyncio
+import shlex
 import time
 
 import pytest
@@ -7,11 +8,12 @@ from fakes import FakeRunner
 from ia_gate.adb import AdbClient, TransportId
 from ia_gate.identity import MARKER_PATH, Fingerprint
 from ia_gate.registry import DeviceRegistry, RegistryError
-from ia_gate.resolver import DeviceResolver, DeviceStatus, DeviceUnavailable
+from ia_gate.resolver import IDENTITY_PROBE, DeviceResolver, DeviceStatus, DeviceUnavailable
 
 NOW = "2026-10-29T10:00:00+00:00"
 BOGUS = "0123456789ABCDEF"
 CAT = ["shell", "cat", MARKER_PATH]
+PROBE = ["shell", "sh", "-c", shlex.quote(IDENTITY_PROBE)]
 PROPS = ("ro.serialno", "ro.product.manufacturer", "ro.product.model")
 
 FP_A = Fingerprint("R58M12AAAAA", "aaaa1111", "samsung", "SM-A")
@@ -27,6 +29,11 @@ def state_line(serial, state, tid):
     return f"{serial}\t{state} usb:1-1 transport_id:{tid}"
 
 
+def legacy(serial, model="SM_X"):
+    """A device line from an old adb that does not report transport ids."""
+    return f"{serial}\tdevice product:p model:{model} device:d"
+
+
 class Bench:
     """A FakeRunner plus a simulated marker file per device (writes are visible to later reads)."""
 
@@ -35,12 +42,15 @@ class Bench:
         self.adb = AdbClient(self._run)
         self.registry = DeviceRegistry(tmp_path / "devices.json")
         self.resolver = DeviceResolver(self.adb, self.registry)
+        self._fingerprints = {}
 
     async def _run(self, args, timeout):
         result = await self.fake(args, timeout)
-        if args[3:6] == ["shell", "sh", "-c"] and args[6].startswith("'echo "):
+        if args[3:6] == ["shell", "sh", "-c"] and args[6] != PROBE[-1]:
             target = TransportId(int(args[2])) if args[1] == "-t" else args[2]
-            self.fake.on(CAT, stdout=args[6].split()[1] + "\n", serial=target)
+            marker = args[6].split()[1]
+            self.fake.on(CAT, stdout=marker + "\n", serial=target)
+            self._probe(target, self._fingerprints[target], marker)
         return result
 
     def devices(self, *lines):
@@ -48,7 +58,12 @@ class Bench:
             ["devices", "-l"], stdout="List of devices attached\n" + "".join(f"{x}\n" for x in lines)
         )
 
+    def _probe(self, target, fp, marker):
+        stdout = f"serialno={fp.serialno}\nandroid_id={fp.android_id or 'null'}\nmarker={marker or ''}\n"
+        self.fake.on(PROBE, stdout=stdout, serial=target)
+
     def device(self, target, fp, marker=None):
+        self._fingerprints[target] = fp
         self.fake.on(["shell", "getprop", "ro.serialno"], stdout=fp.serialno + "\n", serial=target)
         self.fake.on(
             ["shell", "settings", "get", "secure", "android_id"],
@@ -62,6 +77,7 @@ class Bench:
             self.fake.on(CAT, returncode=1, stderr="No such file or directory", serial=target)
         else:
             self.fake.on(CAT, stdout=marker + "\n", serial=target)
+        self._probe(target, fp, marker)
 
     def shell_calls(self):
         return [call for call in self.fake.calls if "shell" in call]
@@ -91,21 +107,100 @@ async def test_snapshot_reports_unauthorized_unenrolled_device(bench):
     assert bench.shell_calls() == []
 
 
-async def test_fingerprint_cached_until_serial_leaves(bench):
+def probe_calls(bench):
+    return [c for c in bench.fake.calls if c[3:] == PROBE or c[5:] == PROBE]
+
+
+async def test_model_cached_until_connection_leaves_identity_reread_each_scan(bench):
     bench.devices(usb("R58A", 1))
     bench.device("R58A", FP_A)
     await bench.resolver.snapshot()
     await bench.resolver.snapshot()
-    serialno_reads = [c for c in bench.fake.calls if c[-1] == "ro.serialno"]
-    assert len(serialno_reads) == 1
-    # The marker is re-read every time: enrollment may have changed it.
-    assert len([c for c in bench.fake.calls if c[-1] == MARKER_PATH]) == 2
+    model_reads = [c for c in bench.fake.calls if c[-1] == "ro.product.model"]
+    assert len(model_reads) == 1
+    # serialno, android_id and marker are re-read on every scan, in a single adb call: the
+    # connection key (adb serial, transport id) does not prove it is still the same device.
+    assert len(probe_calls(bench)) == 2
+    assert [c for c in bench.fake.calls if c[-1] == "ro.serialno"] == []
 
     bench.devices()
     await bench.resolver.snapshot()
     bench.devices(usb("R58A", 1))
     await bench.resolver.snapshot()
-    assert len([c for c in bench.fake.calls if c[-1] == "ro.serialno"]) == 2
+    assert len([c for c in bench.fake.calls if c[-1] == "ro.product.model"]) == 2
+
+
+async def test_cached_model_dropped_when_identity_changes_behind_same_key(bench):
+    bench.devices(usb("10.0.0.5:5555", 1))
+    bench.device("10.0.0.5:5555", FP_A)
+    assert await bench.resolver.snapshot() == [DeviceStatus(None, "10.0.0.5:5555", "online", "", "SM-A")]
+    # The DHCP lease goes to another device, and adb restarted: same serial, same transport id.
+    bench.device("10.0.0.5:5555", FP_B)
+    assert await bench.resolver.snapshot() == [DeviceStatus(None, "10.0.0.5:5555", "online", "", "SM-B")]
+
+
+async def test_swapped_transport_ids_after_adb_restart_are_not_confused(bench):
+    # Same bogus adb serial and ro.serialno; after an adb server restart the transport ids are
+    # handed out in the other order while no scan ran in between.
+    fp1 = Fingerprint(BOGUS, "aaaa1111", "acme", "VAL")
+    fp2 = Fingerprint(BOGUS, "bbbb2222", "acme", "VAL")
+    bench.registry.enroll("VAL-1", fp1, "", NOW)
+    bench.registry.enroll("VAL-2", fp2, "", NOW)
+    bench.devices(usb(BOGUS, 1), usb(BOGUS, 2))
+    bench.device(TransportId(1), fp1, marker="VAL-1")
+    bench.device(TransportId(2), fp2, marker="VAL-2")
+    assert await bench.resolver.resolve("VAL-1") == TransportId(1)
+    assert await bench.resolver.resolve("VAL-2") == TransportId(2)
+
+    bench.device(TransportId(1), fp2, marker="VAL-2")
+    bench.device(TransportId(2), fp1, marker="VAL-1")
+    assert await bench.resolver.resolve("VAL-1") == TransportId(2)
+    assert await bench.resolver.resolve("VAL-2") == TransportId(1)
+
+
+async def test_swapped_devices_without_marker_are_not_confused(bench):
+    fp1 = Fingerprint(BOGUS, "aaaa1111", "acme", "VAL")
+    fp2 = Fingerprint(BOGUS, "bbbb2222", "acme", "VAL")
+    bench.registry.enroll("VAL-1", fp1, "", NOW)
+    bench.registry.enroll("VAL-2", fp2, "", NOW)
+    bench.devices(usb(BOGUS, 1), usb(BOGUS, 2))
+    bench.device(TransportId(1), fp1)
+    bench.device(TransportId(2), fp2)
+    assert await bench.resolver.resolve("VAL-1") == TransportId(1)
+
+    bench.device(TransportId(1), fp2)
+    bench.device(TransportId(2), fp1)
+    assert await bench.resolver.resolve("VAL-1") == TransportId(2)
+
+
+async def test_wifi_address_reused_by_other_device_with_old_adb(bench):
+    # Old adb (no transport id): the connection key is (ip:port, None) for both devices.
+    bench.registry.enroll("VAL-1", FP_A, "", NOW)
+    bench.registry.enroll("VAL-2", FP_B, "", NOW)
+    bench.devices(legacy("10.0.0.5:5555"))
+    bench.device("10.0.0.5:5555", FP_A, marker="VAL-1")
+    assert await bench.resolver.resolve("VAL-1") == "10.0.0.5:5555"
+
+    bench.device("10.0.0.5:5555", FP_B, marker="VAL-2")
+    with pytest.raises(DeviceUnavailable, match="VAL-1 n'est pas connecté"):
+        await bench.resolver.resolve("VAL-1")
+    assert await bench.resolver.resolve("VAL-2") == "10.0.0.5:5555"
+
+
+async def test_probe_parses_missing_marker_and_null_android_id(bench):
+    fp = Fingerprint("R58Q", "", "acme", "VAL")
+    bench.registry.enroll("VAL-9", fp, "", NOW)
+    bench.devices(usb("R58Q", 1))
+    bench.device("R58Q", fp)
+    assert await bench.resolver.resolve("VAL-9") == "R58Q"
+    assert (await bench.resolver.snapshot())[0].model == "VAL"
+
+
+async def test_unparseable_probe_output_counts_as_offline(bench):
+    bench.devices(usb("R58A", 1))
+    bench.device("R58A", FP_A)
+    bench.fake.on(PROBE, stdout="sh: settings: not found\n", serial="R58A")
+    assert await bench.resolver.snapshot() == [DeviceStatus(None, "R58A", "offline", "", "SM X")]
 
 
 async def test_resolve_follows_device_from_usb_to_wifi(bench):
