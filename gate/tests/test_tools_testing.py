@@ -1,3 +1,4 @@
+import asyncio
 import shlex
 from pathlib import Path
 
@@ -7,7 +8,12 @@ from conftest import NOW
 from ia_gate.adb import AdbTimeout
 from ia_gate.config import DEFAULT_SHELL_ALLOWLIST
 from ia_gate.identity import Fingerprint
-from ia_gate.tools.testing import InstrumentResult, check_shell_command, parse_instrument_output
+from ia_gate.tools.testing import (
+    InstrumentResult,
+    check_shell_command,
+    instrumentation_targets,
+    parse_instrument_output,
+)
 
 DATA = Path(__file__).parent / "data"
 FP_A = Fingerprint("R58M12AAAAA", "aaaa1111", "samsung", "SM-A505F")
@@ -195,6 +201,86 @@ async def test_run_tests_timeout_is_actionable(client, bench, fake, device):
     assert "30 s" in text(result)
     assert "timeout_s" in text(result)
     assert "VAL-042" in text(result)
+
+
+PM_LIST_INSTRUMENTATION = """\
+instrumentation:com.other.test/androidx.test.runner.AndroidJUnitRunner (target=com.other)
+instrumentation:com.example.test/androidx.test.runner.AndroidJUnitRunner (target=com.example)
+"""
+
+
+def force_stops(fake):
+    return [call[-1] for call in fake.calls if call[3:6] == ["shell", "am", "force-stop"]]
+
+
+def time_out_instrument(bench, order):
+    real = bench.fake
+
+    async def timing_out(args, timeout):
+        order.append(list(args))
+        if "instrument" in args:
+            raise AdbTimeout("Commande adb expirée")
+        return await real(args, timeout)
+
+    bench.fake = timing_out
+
+
+def test_instrumentation_targets_reads_pm_list():
+    assert instrumentation_targets(PM_LIST_INSTRUMENTATION, TEST_PKG) == ["com.example"]
+    assert instrumentation_targets(PM_LIST_INSTRUMENTATION, "com.absent.test") == []
+
+
+async def test_run_tests_timeout_force_stops_instrumentation(client, bench, fake, device):
+    fake.on(["shell", "pm", "list", "instrumentation"], stdout=PM_LIST_INSTRUMENTATION, serial=device)
+    fake.on(["shell", "am", "force-stop"], serial=device)
+    order: list[list[str]] = []
+    time_out_instrument(bench, order)
+
+    result = await client.call_tool(
+        "run_instrumented_tests", {"device_id": "VAL-042", "test_package": TEST_PKG, "timeout_s": 30}
+    )
+
+    assert result.is_error
+    assert "30 s" in text(result)
+    assert sorted(force_stops(fake)) == ["com.example", TEST_PKG]
+    instrument_index = next(i for i, call in enumerate(order) if "instrument" in call and "am" in call)
+    stop_indexes = [i for i, call in enumerate(order) if "force-stop" in call]
+    assert stop_indexes and min(stop_indexes) > instrument_index
+
+
+async def test_run_tests_timeout_cleanup_failure_keeps_timeout_error(client, bench, fake, device):
+    fake.on(["shell", "pm", "list", "instrumentation"], returncode=1, stderr="boom", serial=device)
+    fake.on(["shell", "am", "force-stop"], returncode=1, stderr="boom", serial=device)
+    time_out_instrument(bench, [])
+
+    result = await client.call_tool(
+        "run_instrumented_tests", {"device_id": "VAL-042", "test_package": TEST_PKG, "timeout_s": 30}
+    )
+
+    assert result.is_error
+    assert "expirés après 30 s" in text(result)
+    assert "timeout_s" in text(result)
+    assert force_stops(fake) == [TEST_PKG]
+
+
+async def test_run_tests_cancelled_force_stops_instrumentation(server, fake, device):
+    fake.on(["shell", "am", "instrument"], stdout="", delay=60, serial=device)
+    fake.on(["shell", "pm", "list", "instrumentation"], stdout=PM_LIST_INSTRUMENTATION, serial=device)
+    fake.on(["shell", "am", "force-stop"], serial=device)
+
+    task = asyncio.create_task(
+        server.call_tool("run_instrumented_tests", {"device_id": "VAL-042", "test_package": TEST_PKG})
+    )
+    for _ in range(200):
+        if instrument_calls(fake):
+            break
+        await asyncio.sleep(0.01)
+    assert instrument_calls(fake)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert sorted(force_stops(fake)) == ["com.example", TEST_PKG]
 
 
 async def test_run_tests_missing_instrumentation_is_actionable(client, fake, device):

@@ -7,12 +7,15 @@ structured result. `shell` only runs commands whose first words match an entry o
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 import shlex
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
+import anyio
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -21,6 +24,8 @@ from ia_gate.context import GateContext, audited, device_call
 from ia_gate.identity import normalize_device_id
 from ia_gate.tools.apps import check_package
 from ia_gate.tools.observe import truncate_tail
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_RUNNER = "androidx.test.runner.AndroidJUnitRunner"
 RAW_TAIL_CHARS = 4000
@@ -36,6 +41,10 @@ _STATUS_PREFIX = "INSTRUMENTATION_STATUS: "
 _STATUS_CODE_RE = re.compile(r"INSTRUMENTATION_STATUS_CODE: (-?\d+)")
 _RUN_CODE_RE = re.compile(r"INSTRUMENTATION_CODE: (-?\d+)")
 _MISSING_INSTRUMENTATION = "Unable to find instrumentation info"
+# `pm list instrumentation` line: "instrumentation:TEST_PKG/RUNNER (target=TARGET_PKG)".
+_INSTRUMENTATION_LINE_RE = re.compile(r"instrumentation:([^/\s]+)/\S+ \(target=([^)\s]+)\)")
+# Upper bound of the best-effort cleanup run after a timed-out or cancelled instrumentation.
+STOP_TIMEOUT_S = 30
 
 _CLASS = r"[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*"
 # A runner may be given relative to the test package (`.MyRunner`), as `am instrument` allows.
@@ -171,6 +180,42 @@ def bounded_adb_failure(exc: AdbError, max_bytes: int) -> ToolError:
     return ToolError(f"{header} : {truncate_tail(output, max_bytes)}")
 
 
+def instrumentation_targets(text: str, test_package: str) -> list[str]:
+    """The target packages declared by the instrumentations of `test_package`, read from the
+    output of `pm list instrumentation`."""
+    targets: list[str] = []
+    for line in text.splitlines():
+        match = _INSTRUMENTATION_LINE_RE.fullmatch(line.strip())
+        if match and match.group(1) == test_package and match.group(2) not in targets:
+            targets.append(match.group(2))
+    return targets
+
+
+async def stop_instrumentation(ctx: GateContext, target: Target, test_package: str) -> None:
+    """Best effort: force-stop the package under test and `test_package` on the device.
+
+    Killing the host-side `am instrument -w` does not stop the instrumentation on the device: the
+    tests would keep driving the UI after the device lock is released. Never raises (except on
+    cancellation of this cleanup itself), so the caller's original error is kept; shielded from
+    the cancellation of the enclosing call so that it also runs when the MCP call is cancelled.
+    """
+    with anyio.CancelScope(shield=True), anyio.move_on_after(STOP_TIMEOUT_S):
+        packages: list[str] = []
+        try:
+            listing = (await ctx.adb.shell(target, ["pm", "list", "instrumentation"])).text
+            packages = instrumentation_targets(listing, test_package)
+        except Exception:
+            logger.warning("Lecture de pm list instrumentation impossible sur %s", target, exc_info=True)
+        if test_package not in packages:
+            packages.append(test_package)
+        for package in packages:
+            try:
+                check_package(package)
+                await ctx.adb.shell(target, ["am", "force-stop", package])
+            except Exception:
+                logger.warning("am force-stop %s impossible sur %s", package, target, exc_info=True)
+
+
 def _check_runner(runner: str) -> str:
     if not _RUNNER_RE.fullmatch(runner):
         raise ValueError(
@@ -227,10 +272,14 @@ def register(server: MCPServer, ctx: GateContext) -> None:
         async def op(target: Target) -> dict[str, Any]:
             try:
                 output = (await ctx.adb.shell(target, args, timeout=timeout_s)).text
+            except asyncio.CancelledError:
+                await stop_instrumentation(ctx, target, test_package)
+                raise
             except AdbTimeout as exc:
+                await stop_instrumentation(ctx, target, test_package)
                 raise ToolError(
-                    f"Tests instrumentés expirés après {timeout_s} s sur {key} : augmentez timeout_s "
-                    "ou limitez la campagne avec test_class."
+                    f"Tests instrumentés expirés après {timeout_s} s sur {key} (exécution arrêtée par "
+                    "am force-stop) : augmentez timeout_s ou limitez la campagne avec test_class."
                 ) from exc
             except AdbNotFound:
                 raise
