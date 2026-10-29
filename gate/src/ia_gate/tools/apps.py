@@ -68,7 +68,7 @@ def check_apk_path(raw: str, apk_dirs: Sequence[Path]) -> Path:
 
 
 def check_package(package: str) -> str:
-    if not PACKAGE_RE.match(package):
+    if not PACKAGE_RE.fullmatch(package):
         raise ValueError(
             f"Nom de package invalide : {package!r}. Indiquez un nom Android complet "
             "(ex. com.example.app), visible avec `shell` « pm list packages »."
@@ -77,7 +77,7 @@ def check_package(package: str) -> str:
 
 
 def _check_activity(activity: str) -> str:
-    if not _ACTIVITY_RE.match(activity):
+    if not _ACTIVITY_RE.fullmatch(activity):
         raise ValueError(
             f"Activité invalide : {activity!r}. Indiquez le nom de classe seul (ex. .MainActivity "
             "ou com.example.app.MainActivity), sans le package ni « / »."

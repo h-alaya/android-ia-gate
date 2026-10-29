@@ -25,7 +25,7 @@ _BOGUS_SERIALNOS = frozenset({"", "unknown", "0123456789abcdef", "0123456789"})
 def normalize_device_id(raw: str) -> str:
     """Strip and upper-case a gate ID; raise `ValueError` if it does not match `DEVICE_ID_RE`."""
     device_id = raw.strip().upper()
-    if not DEVICE_ID_RE.match(device_id):
+    if not DEVICE_ID_RE.fullmatch(device_id):
         raise ValueError(
             f"ID d'équipement invalide : {raw!r}. Format attendu : 2 à 32 caractères parmi "
             "A-Z0-9, `_` et `-`, commençant par une lettre ou un chiffre (ex. VAL-042)."

@@ -386,6 +386,8 @@ async def test_stop_app(client, fake, device):
         ("launch_app", "1com.example"),
         ("stop_app", "com..example"),
         ("stop_app", "-p com.example"),
+        ("uninstall_app", "com.example.app\n"),
+        ("stop_app", "com.example.app\n"),
     ],
 )
 async def test_invalid_package_name_refused(client, fake, device, tool, package):
@@ -396,7 +398,7 @@ async def test_invalid_package_name_refused(client, fake, device, tool, package)
     assert fake.calls == []
 
 
-@pytest.mark.parametrize("activity", ["com.example.app/.Main", ".Main; reboot", "", "-a"])
+@pytest.mark.parametrize("activity", ["com.example.app/.Main", ".Main; reboot", "", "-a", ".Main\n"])
 async def test_invalid_activity_refused(client, fake, device, activity):
     result = await client.call_tool(
         "launch_app", {"device_id": "VAL-042", "package": PKG, "activity": activity}

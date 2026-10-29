@@ -81,7 +81,7 @@ def register(server: MCPServer, ctx: GateContext) -> None:
         to TCP mode first (`adb tcpip 5555` over USB). Then use list_devices."""
         host = host.strip()
         # One colon is `ip:port` (an IPv6 address has several): the port has its own argument.
-        if not host or not _HOST_RE.match(host) or host.count(":") == 1:
+        if not host or not _HOST_RE.fullmatch(host) or host.count(":") == 1:
             raise ValueError(
                 f"Adresse invalide : {host!r}. Indiquez l'IP ou le nom d'hôte de l'équipement "
                 "(ex. 192.168.1.50), sans port ni espace."
